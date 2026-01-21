@@ -1,10 +1,14 @@
 # Gatekeeper - Project Overview
 
 ## Purpose
-Gatekeeper is designed to be a multi-tenant API gateway that authenticates requests using API keys, enforces per client rate limits, and records usage metrics for analytics.
+Gatekeeper is a backend, server-based, multi-tenant API gateway that authenticates requests using API keys, enforces per-client rate limits, and records usage metrics for analytics and operational insight.
+
+Gatekeeper operates as a long-running HTTP service and exposes both request-handling (data plane) and administrative (control plane) APIs.
 
 ## Problem Statement
-A public facing API needs to protect backend services from being exploited or overloaded. It must also provide some usage details to the client. Without oversight, the backend system is susceptible to issues such as denial of service, runaway clients, and mismanagement of resources.
+Public-facing APIs must protect backend services from abuse, excessive load, and unauthorized access while also providing visibility into client usage.
+
+Without a gateway layer enforcing authentication, rate limits, and observability, backend systems are vulnerable to denial-of-service attacks, runaway clients, and poor operational insight.
 
 ## Goals
 - Provide API key authentication for multi-tenant clients.
@@ -18,7 +22,6 @@ A public facing API needs to protect backend services from being exploited or ov
 - Web application firewalls
 - OAuth providers
 - Service mesh
-- Front end dashboard UI
 - Multi-region deployment
 
 ## Target Users

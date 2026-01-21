@@ -18,7 +18,15 @@ The SRS document defines the functional and non-functional requirements for Gate
 ## Overall Description
 
 ### 2.1 System Context
-Gatekeeper is located in the backend and serves as middleware between the API and the front end. Requests are authenticated, rate limited, logged, and either accepted or denied using the appropriate HTTP code.
+Gatekeeper runs as a standalone backend server positioned in front of application endpoints.
+
+Incoming requests pass through authentication, rate limiting, and logging stages before being accepted or rejected with appropriate HTTP responses.
+
+Gatekeeper exposes:
+
+- Gateway APIs for client request handling
+
+- Admin APIs for configuration and analytics
 
 ### 2.2 User Classes
 
@@ -101,11 +109,9 @@ Gatekeeper is located in the backend and serves as middleware between the API an
 ## 6. Out of Scope
 - OAuth or third-party identity providers
 - Billing or payment processing
-- Web-based dashboards or UI clients
 - Multi-region or high-availability deployment
 
 ## 7. Traceability
 Each functional requirement (FR) shall be traceable to:
 - Architecture components
 - API endpoints
-- Test cases defined in `docs/06_test_plan.md`
