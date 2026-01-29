@@ -14,4 +14,5 @@ COPY src ./src
 
 EXPOSE 8080
 
-CMD ["uvicorn", "gatekeeper.main:app", "--host", "0.0.0.0", "--port", "8080"]
+COPY scripts/entrypoint.sh /app/entrypoint.sh
+CMD ["/app/entrypoint.sh"]
