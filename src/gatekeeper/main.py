@@ -5,6 +5,7 @@ from gatekeeper.logging import setup_logging
 from gatekeeper.core.request_id import RequestIdMiddleware
 from gatekeeper.api.health import router as health_router
 from gatekeeper.api.admin import router as admin_router
+from gatekeeper.api.gateway import router as gateway_router
 
 
 setup_logging(settings.log_level)
@@ -15,6 +16,7 @@ app = FastAPI(title="Gatekeeper", version="0.1.0")
 app.add_middleware(RequestIdMiddleware)
 app.include_router(health_router)
 app.include_router(admin_router)
+app.include_router(gateway_router)
 
 @app.middleware("http")
 async def inject_request_id_into_logs(request: Request, call_next):
