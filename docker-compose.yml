@@ -1,0 +1,36 @@
+services:
+  gateway:
+    build: .
+    container_name: gatekeeper-gateway
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ./src:/app/src
+
+  postgres:
+    image: postgres:16
+    container_name: gatekeeper-postgres
+    environment:
+      POSTGRES_DB: gatekeeper
+      POSTGRES_USER: gatekeeper
+      POSTGRES_PASSWORD: gatekeeper
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gatekeeper -d gatekeeper"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    container_name: gatekeeper-redis
+    ports:
+      - "6379:6379"
