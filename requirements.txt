@@ -10,3 +10,5 @@ asyncpg==0.30.0
 redis==5.2.1
 
 python-json-logger==3.2.1
+
+alembic==1.14.0
