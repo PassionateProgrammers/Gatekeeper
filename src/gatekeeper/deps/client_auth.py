@@ -1,14 +1,13 @@
 from fastapi import Depends, Header, HTTPException, Request, Response, status
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from gatekeeper.db import get_db
-from gatekeeper.models import ApiKey
-from gatekeeper.security import hash_key
 from gatekeeper.config import settings
-from gatekeeper.deps.redis import get_redis
+from gatekeeper.core.keys import hash_key
 from gatekeeper.core.rate_limit import fixed_window_limit
-
+from gatekeeper.deps.db import get_db
+from gatekeeper.deps.redis import get_redis
+from gatekeeper.models.api_key import ApiKey
 
 async def require_client_key(
     request: Request,
@@ -17,54 +16,35 @@ async def require_client_key(
     r = Depends(get_redis),
     authorization: str | None = Header(default=None),
 ) -> ApiKey:
-    # 1. Expect: Authorization: Bearer <key>
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing API key",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing API key")
 
     plain = authorization.removeprefix("Bearer ").strip()
     if not plain:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing API key",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing API key")
 
-    # 2. Hash and lookup key
     hashed = hash_key(plain)
-
-    res = await db.execute(
-        select(ApiKey).where(ApiKey.key_hash == hashed)
-    )
+    res = await db.execute(select(ApiKey).where(ApiKey.key_hash == hashed))
     api_key = res.scalar_one_or_none()
 
     if not api_key or api_key.revoked_at is not None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
-    # 3. Rate limiting (ONLY after valid key)
+    # rate limit AFTER valid key
     rl = await fixed_window_limit(
-        r,
+        await r,  # IMPORTANT because your get_redis() is async
         key=str(api_key.id),
         limit=settings.rate_limit_requests,
         window_seconds=settings.rate_limit_window_seconds,
     )
-
     response.headers["X-RateLimit-Limit"] = str(rl.limit)
     response.headers["X-RateLimit-Remaining"] = str(rl.remaining)
     response.headers["X-RateLimit-Reset"] = str(rl.reset_epoch)
 
     if not rl.allowed:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Rate limit exceeded",
-        )
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
 
-    # 4. Attach context for downstream handlers/logging
     request.state.tenant_id = api_key.tenant_id
     request.state.api_key_id = api_key.id
-
     return api_key
+
