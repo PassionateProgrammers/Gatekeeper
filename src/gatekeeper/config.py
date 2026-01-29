@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8080
     log_level: str = "INFO"
+    admin_token: str = "dev-admin-token"
 
     postgres_host: str = "postgres"
     postgres_port: int = 5432
