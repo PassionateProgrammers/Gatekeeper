@@ -30,9 +30,14 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 
   redis:
     image: redis:7
     container_name: gatekeeper-redis
     ports:
       - "6379:6379"
+  
+volumes:
+  postgres_data:
