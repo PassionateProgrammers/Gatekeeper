@@ -13,6 +13,8 @@ services:
         condition: service_started
     volumes:
       - ./src:/app/src
+      - ./alembic.ini:/app/alembic.ini
+      - ./alembic:/app/alembic
 
   postgres:
     image: postgres:16

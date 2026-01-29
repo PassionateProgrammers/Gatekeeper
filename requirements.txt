@@ -12,3 +12,5 @@ redis==5.2.1
 python-json-logger==3.2.1
 
 alembic==1.14.0
+
+psycopg[binary]==3.2.4
