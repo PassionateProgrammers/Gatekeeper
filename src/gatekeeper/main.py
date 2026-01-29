@@ -6,6 +6,7 @@ from gatekeeper.core.request_id import RequestIdMiddleware
 from gatekeeper.api.health import router as health_router
 from gatekeeper.api.admin import router as admin_router
 from gatekeeper.api.gateway import router as gateway_router
+from gatekeeper.deps.redis import close_redis
 
 
 setup_logging(settings.log_level)
@@ -17,6 +18,10 @@ app.add_middleware(RequestIdMiddleware)
 app.include_router(health_router)
 app.include_router(admin_router)
 app.include_router(gateway_router)
+
+@app.on_event("shutdown")
+async def shutdown():
+    await close_redis()
 
 @app.middleware("http")
 async def inject_request_id_into_logs(request: Request, call_next):

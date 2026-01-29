@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     postgres_db: str = "gatekeeper"
     postgres_user: str = "gatekeeper"
     postgres_password: str = "gatekeeper"
+    
+    rate_limit_requests: int = 10
+    rate_limit_window_seconds: int = 10
 
     redis_host: str = "redis"
     redis_port: int = 6379

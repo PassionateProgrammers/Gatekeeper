@@ -1,18 +1,23 @@
-from fastapi import Depends, Header, HTTPException, Request, status
-from sqlalchemy import select
+from fastapi import Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
-from gatekeeper.core.keys import hash_key
-from gatekeeper.deps.db import get_db
-from gatekeeper.models.api_key import ApiKey
+from gatekeeper.db import get_db
+from gatekeeper.models import ApiKey
+from gatekeeper.security import hash_key
+from gatekeeper.config import settings
+from gatekeeper.deps.redis import get_redis
+from gatekeeper.core.rate_limit import fixed_window_limit
 
 
 async def require_client_key(
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
+    r = Depends(get_redis),
     authorization: str | None = Header(default=None),
 ) -> ApiKey:
-    # Expect: Authorization: Bearer <key>
+    # 1. Expect: Authorization: Bearer <key>
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -26,6 +31,7 @@ async def require_client_key(
             detail="Missing API key",
         )
 
+    # 2. Hash and lookup key
     hashed = hash_key(plain)
 
     res = await db.execute(
@@ -39,7 +45,25 @@ async def require_client_key(
             detail="Invalid API key",
         )
 
-    # Attach context for downstream handlers/logging
+    # 3. Rate limiting (ONLY after valid key)
+    rl = await fixed_window_limit(
+        r,
+        key=str(api_key.id),
+        limit=settings.rate_limit_requests,
+        window_seconds=settings.rate_limit_window_seconds,
+    )
+
+    response.headers["X-RateLimit-Limit"] = str(rl.limit)
+    response.headers["X-RateLimit-Remaining"] = str(rl.remaining)
+    response.headers["X-RateLimit-Reset"] = str(rl.reset_epoch)
+
+    if not rl.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded",
+        )
+
+    # 4. Attach context for downstream handlers/logging
     request.state.tenant_id = api_key.tenant_id
     request.state.api_key_id = api_key.id
 
