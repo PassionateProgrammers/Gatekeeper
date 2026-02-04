@@ -20,3 +20,7 @@ class UsageEvent(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
 
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    client_ip: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_agent: Mapped[str] = mapped_column(String(512), nullable=False)
