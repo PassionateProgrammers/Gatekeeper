@@ -30,6 +30,9 @@ async def require_client_key(
     if not api_key or api_key.revoked_at is not None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
+    request.state.tenant_id = api_key.tenant_id
+    request.state.api_key_id = api_key.id
+    
     # rate limit AFTER valid key
     rl = await fixed_window_limit(
         await r,  # IMPORTANT because your get_redis() is async
@@ -44,7 +47,5 @@ async def require_client_key(
     if not rl.allowed:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
 
-    request.state.tenant_id = api_key.tenant_id
-    request.state.api_key_id = api_key.id
     return api_key
 
