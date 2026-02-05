@@ -9,6 +9,10 @@ from starlette.responses import Response
 from gatekeeper.deps.db import SessionLocal
 from gatekeeper.models.usage_event import UsageEvent
 
+def _get_client_ip(request: Request) -> str | None:
+    if request.client:
+        return request.client.host
+    return None
 
 class UsageLoggingMiddleware(BaseHTTPMiddleware):
     """
@@ -30,29 +34,31 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
             tenant_id = getattr(request.state, "tenant_id", None)
             api_key_id = getattr(request.state, "api_key_id", None)
 
-            # Only log requests that successfully resolved a key (or were rate-limited after resolving it)
-            if not tenant_id or not api_key_id:
-                return
+            if tenant_id and api_key_id:
+                status_code = response.status_code if response else 500
+                request_id = getattr(request.state, "request_id", None)
 
-            status_code = response.status_code if response is not None else 500
+                user_agent = request.headers.get("user-agent")
+                client_ip = _get_client_ip(request)
 
-            # Optional: don’t log admin/health endpoints
-            # (you can tweak this list however you want)
-            path = request.url.path
-            if path.startswith("/admin") or path.startswith("/health") or path.startswith("/docs") or path.startswith("/openapi.json"):
-                return
+                # Avoid logging noise for health/docs if you want:
+                path = request.url.path
+                if path in ("/health",):
+                    return
 
-            event = UsageEvent(
-                tenant_id=tenant_id,
-                api_key_id=api_key_id,
-                method=request.method,
-                path=path,
-                status_code=status_code,
-                latency_ms=latency_ms,
-                ts=datetime.now(timezone.utc),
-            )
-
-            # Write it using a fresh session (middleware can't use Depends(get_db))
-            async with SessionLocal() as session:
-                session.add(event)
-                await session.commit()
+                async with SessionLocal() as db:
+                    db.add(
+                        UsageEvent(
+                            tenant_id=tenant_id,
+                            api_key_id=api_key_id,
+                            method=request.method,
+                            path=path,
+                            status_code=status_code,
+                            latency_ms=latency_ms,
+                            ts=datetime.now(timezone.utc),
+                            request_id=request_id,
+                            client_ip=client_ip,
+                            user_agent=user_agent,
+                        )
+                    )
+                    await db.commit()
