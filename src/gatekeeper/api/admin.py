@@ -32,10 +32,21 @@ class ApiKeyCreateOut(BaseModel):
     api_key: str
 
 
-# NEW
 class ApiKeyLimitsIn(BaseModel):
     rate_limit: int = Field(ge=1, le=1_000_000)
-    rate_window: int = Field(ge=1, le=86_400)  # seconds (up to 24h)
+    rate_window: int = Field(ge=1, le=86_400)
+
+
+# NEW
+class ApiKeyTierIn(BaseModel):
+    tier: str = Field(min_length=1, max_length=32)
+
+
+TIERS = {
+    "free": {"rate_limit": 10, "rate_window": 60},
+    "pro": {"rate_limit": 120, "rate_window": 60},
+    "enterprise": {"rate_limit": 600, "rate_window": 60},
+}
 
 
 @router.post("/tenants", response_model=TenantOut, dependencies=[Depends(require_admin)])
@@ -338,6 +349,37 @@ async def set_key_limits(
     return {
         "status": "ok",
         "key_id": str(api_key.id),
+        "rate_limit": api_key.rate_limit,
+        "rate_window": api_key.rate_window,
+    }
+
+
+@router.post("/keys/{key_id}/tier", dependencies=[Depends(require_admin)])
+async def set_key_tier(
+    key_id: uuid.UUID,
+    payload: ApiKeyTierIn,
+    db: AsyncSession = Depends(get_db),
+):
+    tier = payload.tier.strip().lower()
+    if tier not in TIERS:
+        raise HTTPException(status_code=400, detail=f"Unknown tier. Use one of: {', '.join(TIERS.keys())}")
+
+    api_key = await db.get(ApiKey, key_id)
+    if not api_key:
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    if api_key.revoked_at:
+        raise HTTPException(status_code=409, detail="Key is revoked")
+
+    api_key.rate_limit = TIERS[tier]["rate_limit"]
+    api_key.rate_window = TIERS[tier]["rate_window"]
+    await db.commit()
+    await db.refresh(api_key)
+
+    return {
+        "status": "ok",
+        "key_id": str(api_key.id),
+        "tier": tier,
         "rate_limit": api_key.rate_limit,
         "rate_window": api_key.rate_window,
     }
