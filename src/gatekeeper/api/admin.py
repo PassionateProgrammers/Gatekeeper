@@ -32,6 +32,12 @@ class ApiKeyCreateOut(BaseModel):
     api_key: str
 
 
+# NEW
+class ApiKeyLimitsIn(BaseModel):
+    rate_limit: int = Field(ge=1, le=1_000_000)
+    rate_window: int = Field(ge=1, le=86_400)  # seconds (up to 24h)
+
+
 @router.post("/tenants", response_model=TenantOut, dependencies=[Depends(require_admin)])
 async def create_tenant(payload: TenantCreateIn, db: AsyncSession = Depends(get_db)):
     now = datetime.now(timezone.utc)
@@ -104,17 +110,17 @@ async def revoke_api_key(key_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
 @router.get("/tenants/{tenant_id}/keys", dependencies=[Depends(require_admin)])
 async def list_api_keys(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
-        select(ApiKey).where(ApiKey.tenant_id == tenant_id)
-    )
+    result = await db.execute(select(ApiKey).where(ApiKey.tenant_id == tenant_id))
     keys = result.scalars().all()
 
     return [
         {
-            "id": k.id,
+            "id": str(k.id),
             "key_prefix": k.key_prefix,
             "created_at": k.created_at,
             "revoked_at": k.revoked_at,
+            "rate_limit": getattr(k, "rate_limit", None),
+            "rate_window": getattr(k, "rate_window", None),
         }
         for k in keys
     ]
@@ -175,9 +181,7 @@ async def top_endpoints(
         select(
             UsageEvent.path,
             func.count().label("count"),
-            func.sum(
-                case((UsageEvent.status_code >= 400, 1), else_=0)
-            ).label("errors"),
+            func.sum(case((UsageEvent.status_code >= 400, 1), else_=0)).label("errors"),
         )
         .where(
             UsageEvent.tenant_id == tenant_id,
@@ -217,9 +221,7 @@ async def usage_by_key(
         select(
             UsageEvent.api_key_id,
             func.count().label("count"),
-            func.sum(
-                case((UsageEvent.status_code >= 400, 1), else_=0)
-            ).label("errors"),
+            func.sum(case((UsageEvent.status_code >= 400, 1), else_=0)).label("errors"),
         )
         .where(
             UsageEvent.tenant_id == tenant_id,
@@ -256,15 +258,9 @@ async def usage_status_classes(
 
     result = await db.execute(
         select(
-            func.sum(
-                case((UsageEvent.status_code.between(200, 299), 1), else_=0)
-            ).label("2xx"),
-            func.sum(
-                case((UsageEvent.status_code.between(400, 499), 1), else_=0)
-            ).label("4xx"),
-            func.sum(
-                case((UsageEvent.status_code >= 500, 1), else_=0)
-            ).label("5xx"),
+            func.sum(case((UsageEvent.status_code.between(200, 299), 1), else_=0)).label("2xx"),
+            func.sum(case((UsageEvent.status_code.between(400, 499), 1), else_=0)).label("4xx"),
+            func.sum(case((UsageEvent.status_code >= 500, 1), else_=0)).label("5xx"),
         )
         .where(
             UsageEvent.tenant_id == tenant_id,
@@ -319,3 +315,29 @@ async def list_usage_events(
         }
         for e in events
     ]
+
+
+@router.post("/keys/{key_id}/limits", dependencies=[Depends(require_admin)])
+async def set_key_limits(
+    key_id: uuid.UUID,
+    payload: ApiKeyLimitsIn,
+    db: AsyncSession = Depends(get_db),
+):
+    api_key = await db.get(ApiKey, key_id)
+    if not api_key:
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    if api_key.revoked_at:
+        raise HTTPException(status_code=409, detail="Key is revoked")
+
+    api_key.rate_limit = payload.rate_limit
+    api_key.rate_window = payload.rate_window
+    await db.commit()
+    await db.refresh(api_key)
+
+    return {
+        "status": "ok",
+        "key_id": str(api_key.id),
+        "rate_limit": api_key.rate_limit,
+        "rate_window": api_key.rate_window,
+    }
