@@ -9,11 +9,12 @@ from gatekeeper.deps.db import get_db
 from gatekeeper.deps.redis import get_redis
 from gatekeeper.models.api_key import ApiKey
 
+
 async def require_client_key(
     request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
-    r = Depends(get_redis),
+    r=Depends(get_redis),
     authorization: str | None = Header(default=None),
 ) -> ApiKey:
     if not authorization or not authorization.startswith("Bearer "):
@@ -32,13 +33,15 @@ async def require_client_key(
 
     request.state.tenant_id = api_key.tenant_id
     request.state.api_key_id = api_key.id
-    
-    # rate limit AFTER valid key
+
+    per_key_limit = getattr(api_key, "rate_limit", None) or settings.rate_limit_requests
+    per_key_window = getattr(api_key, "rate_window", None) or settings.rate_limit_window_seconds
+
     rl = await fixed_window_limit(
-        await r,  # IMPORTANT because your get_redis() is async
+        await r,  
         key=str(api_key.id),
-        limit=settings.rate_limit_requests,
-        window_seconds=settings.rate_limit_window_seconds,
+        limit=int(per_key_limit),
+        window_seconds=int(per_key_window),
     )
     response.headers["X-RateLimit-Limit"] = str(rl.limit)
     response.headers["X-RateLimit-Remaining"] = str(rl.remaining)
@@ -48,4 +51,3 @@ async def require_client_key(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
 
     return api_key
-
