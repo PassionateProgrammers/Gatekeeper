@@ -1,15 +1,16 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekeeper.deps.admin_auth import require_admin
 from gatekeeper.deps.db import get_db
 from gatekeeper.models.tenant import Tenant
 from gatekeeper.models.api_key import ApiKey
+from gatekeeper.models.usage_event import UsageEvent
 from gatekeeper.core.keys import generate_plaintext_key, hash_key, key_prefix
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -28,7 +29,7 @@ class ApiKeyCreateOut(BaseModel):
     key_id: uuid.UUID
     tenant_id: uuid.UUID
     key_prefix: str
-    api_key: str  # plaintext returned once
+    api_key: str
 
 
 @router.post("/tenants", response_model=TenantOut, dependencies=[Depends(require_admin)])
@@ -58,7 +59,6 @@ async def create_api_key(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db
     hashed = hash_key(plain)
     prefix = key_prefix(plain)
 
-    # ultra-low chance collision, but still handle
     existing = await db.execute(select(ApiKey).where(ApiKey.key_hash == hashed))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=500, detail="Key generation collision, retry")
@@ -96,3 +96,61 @@ async def revoke_api_key(key_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     api_key.revoked_at = now
     await db.commit()
     return {"status": "revoked", "key_id": str(api_key.id)}
+
+
+# ---------------- NEW ----------------
+
+@router.get("/tenants/{tenant_id}/keys", dependencies=[Depends(require_admin)])
+async def list_api_keys(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(ApiKey).where(ApiKey.tenant_id == tenant_id)
+    )
+    keys = result.scalars().all()
+
+    return [
+        {
+            "id": k.id,
+            "key_prefix": k.key_prefix,
+            "revoked_at": k.revoked_at,
+            "created_at": k.created_at,
+        }
+        for k in keys
+    ]
+
+
+@router.get("/tenants/{tenant_id}/usage/summary", dependencies=[Depends(require_admin)])
+async def usage_summary(
+    tenant_id: uuid.UUID,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    if not to_ts:
+        to_ts = datetime.now(timezone.utc)
+    if not from_ts:
+        from_ts = to_ts - timedelta(hours=24)
+
+    result = await db.execute(
+        select(
+            UsageEvent.status_code,
+            func.count().label("count"),
+            func.avg(UsageEvent.latency_ms).label("avg_latency"),
+        )
+        .where(
+            UsageEvent.tenant_id == tenant_id,
+            UsageEvent.ts >= from_ts,
+            UsageEvent.ts <= to_ts,
+        )
+        .group_by(UsageEvent.status_code)
+    )
+
+    rows = result.all()
+
+    return {
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "by_status": {str(r.status_code): r.count for r in rows},
+        "avg_latency_ms": round(
+            sum((r.avg_latency or 0) for r in rows) / max(len(rows), 1), 2
+        ),
+    }
