@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func
+from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekeeper.deps.admin_auth import require_admin
@@ -154,3 +154,45 @@ async def usage_summary(
             sum((r.avg_latency or 0) for r in rows) / max(len(rows), 1), 2
         ),
     }
+
+@router.get("/tenants/{tenant_id}/usage/top-endpoints", dependencies=[Depends(require_admin)])
+async def top_endpoints(
+    tenant_id: uuid.UUID,
+    limit: int = 10,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    if not to_ts:
+        to_ts = datetime.now(timezone.utc)
+    if not from_ts:
+        from_ts = to_ts - timedelta(hours=24)
+
+    result = await db.execute(
+        select(
+            UsageEvent.path,
+            func.count().label("count"),
+            func.sum(
+                case((UsageEvent.status_code >= 400, 1), else_=0)
+            ).label("errors"),
+        )
+        .where(
+            UsageEvent.tenant_id == tenant_id,
+            UsageEvent.ts >= from_ts,
+            UsageEvent.ts <= to_ts,
+        )
+        .group_by(UsageEvent.path)
+        .order_by(func.count().desc())
+        .limit(limit)
+    )
+
+    rows = result.all()
+
+    return [
+        {
+            "path": r.path,
+            "count": r.count,
+            "error_rate": round((r.errors or 0) / r.count, 2),
+        }
+        for r in rows
+    ]
