@@ -47,7 +47,11 @@ async def create_tenant(payload: TenantCreateIn, db: AsyncSession = Depends(get_
     return TenantOut(id=tenant.id, name=tenant.name)
 
 
-@router.post("/tenants/{tenant_id}/keys", response_model=ApiKeyCreateOut, dependencies=[Depends(require_admin)])
+@router.post(
+    "/tenants/{tenant_id}/keys",
+    response_model=ApiKeyCreateOut,
+    dependencies=[Depends(require_admin)],
+)
 async def create_api_key(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     now = datetime.now(timezone.utc)
 
@@ -61,7 +65,7 @@ async def create_api_key(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db
 
     existing = await db.execute(select(ApiKey).where(ApiKey.key_hash == hashed))
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=500, detail="Key generation collision, retry")
+        raise HTTPException(status_code=500, detail="Key generation collision")
 
     api_key = ApiKey(
         tenant_id=tenant_id,
@@ -90,15 +94,13 @@ async def revoke_api_key(key_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     if not api_key:
         raise HTTPException(status_code=404, detail="Key not found")
 
-    if api_key.revoked_at is not None:
+    if api_key.revoked_at:
         return {"status": "already_revoked", "key_id": str(api_key.id)}
 
     api_key.revoked_at = now
     await db.commit()
     return {"status": "revoked", "key_id": str(api_key.id)}
 
-
-# ---------------- NEW ----------------
 
 @router.get("/tenants/{tenant_id}/keys", dependencies=[Depends(require_admin)])
 async def list_api_keys(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
@@ -111,8 +113,8 @@ async def list_api_keys(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         {
             "id": k.id,
             "key_prefix": k.key_prefix,
-            "revoked_at": k.revoked_at,
             "created_at": k.created_at,
+            "revoked_at": k.revoked_at,
         }
         for k in keys
     ]
@@ -155,6 +157,7 @@ async def usage_summary(
         ),
     }
 
+
 @router.get("/tenants/{tenant_id}/usage/top-endpoints", dependencies=[Depends(require_admin)])
 async def top_endpoints(
     tenant_id: uuid.UUID,
@@ -196,7 +199,8 @@ async def top_endpoints(
         }
         for r in rows
     ]
-    
+
+
 @router.get("/tenants/{tenant_id}/usage/by-key", dependencies=[Depends(require_admin)])
 async def usage_by_key(
     tenant_id: uuid.UUID,
@@ -236,3 +240,45 @@ async def usage_by_key(
         }
         for r in rows
     ]
+
+
+@router.get("/tenants/{tenant_id}/usage/status-classes", dependencies=[Depends(require_admin)])
+async def usage_status_classes(
+    tenant_id: uuid.UUID,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    if not to_ts:
+        to_ts = datetime.now(timezone.utc)
+    if not from_ts:
+        from_ts = to_ts - timedelta(hours=24)
+
+    result = await db.execute(
+        select(
+            func.sum(
+                case((UsageEvent.status_code.between(200, 299), 1), else_=0)
+            ).label("2xx"),
+            func.sum(
+                case((UsageEvent.status_code.between(400, 499), 1), else_=0)
+            ).label("4xx"),
+            func.sum(
+                case((UsageEvent.status_code >= 500, 1), else_=0)
+            ).label("5xx"),
+        )
+        .where(
+            UsageEvent.tenant_id == tenant_id,
+            UsageEvent.ts >= from_ts,
+            UsageEvent.ts <= to_ts,
+        )
+    )
+
+    row = result.one()
+
+    return {
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "2xx": row[0] or 0,
+        "4xx": row[1] or 0,
+        "5xx": row[2] or 0,
+    }
