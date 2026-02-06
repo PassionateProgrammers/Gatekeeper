@@ -9,15 +9,18 @@ from starlette.responses import Response
 from gatekeeper.deps.db import SessionLocal
 from gatekeeper.models.usage_event import UsageEvent
 
-def _get_client_ip(request: Request) -> str | None:
-    if request.client:
+
+def _get_client_ip(request: Request) -> str:
+    if request.client and request.client.host:
         return request.client.host
-    return None
+    return ""
+
 
 class UsageLoggingMiddleware(BaseHTTPMiddleware):
     """
-    Logs usage for requests that have tenant/api_key context attached
-    (set by require_client_key).
+    Logs usage for ALL requests (including unauth/invalid keys).
+
+    tenant_id/api_key_id may be None for unauth attempts.
     """
 
     async def dispatch(self, request: Request, call_next: Callable):
@@ -28,37 +31,33 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             return response
         finally:
-            # latency in ms
             latency_ms = int((time.perf_counter() - start) * 1000)
+
+            path = request.url.path
+            if path in ("/health",):
+                return
 
             tenant_id = getattr(request.state, "tenant_id", None)
             api_key_id = getattr(request.state, "api_key_id", None)
 
-            if tenant_id and api_key_id:
-                status_code = response.status_code if response else 500
-                request_id = getattr(request.state, "request_id", None)
+            status_code = response.status_code if response else 500
+            request_id = getattr(request.state, "request_id", None) or ""
+            user_agent = request.headers.get("user-agent") or ""
+            client_ip = _get_client_ip(request)
 
-                user_agent = request.headers.get("user-agent")
-                client_ip = _get_client_ip(request)
-
-                # Avoid logging noise for health/docs if you want:
-                path = request.url.path
-                if path in ("/health",):
-                    return
-
-                async with SessionLocal() as db:
-                    db.add(
-                        UsageEvent(
-                            tenant_id=tenant_id,
-                            api_key_id=api_key_id,
-                            method=request.method,
-                            path=path,
-                            status_code=status_code,
-                            latency_ms=latency_ms,
-                            ts=datetime.now(timezone.utc),
-                            request_id=request_id,
-                            client_ip=client_ip,
-                            user_agent=user_agent,
-                        )
+            async with SessionLocal() as db:
+                db.add(
+                    UsageEvent(
+                        tenant_id=tenant_id,      # can be None
+                        api_key_id=api_key_id,    # can be None
+                        method=request.method,
+                        path=path,
+                        status_code=status_code,
+                        latency_ms=latency_ms,
+                        ts=datetime.now(timezone.utc),
+                        request_id=request_id,
+                        client_ip=client_ip,
+                        user_agent=user_agent,
                     )
-                    await db.commit()
+                )
+                await db.commit()
