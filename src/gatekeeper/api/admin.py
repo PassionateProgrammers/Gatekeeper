@@ -552,3 +552,179 @@ async def abuse_suspects(
             for s in suspects
         ],
     }
+    
+    
+@router.get("/usage/rate-limited", dependencies=[Depends(require_admin)])
+async def global_rate_limited_usage(
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    top_limit: int = 10,
+    db: AsyncSession = Depends(get_db),
+):
+    from_ts, to_ts = _resolve_timerange(from_ts, to_ts)
+    top_limit = min(max(top_limit, 1), 50)
+
+    base_where = (
+        UsageEvent.status_code == 429,
+        UsageEvent.ts >= from_ts,
+        UsageEvent.ts <= to_ts,
+    )
+
+    total = await db.scalar(select(func.count()).where(*base_where))
+
+    top_paths = await db.execute(
+        select(
+            UsageEvent.path,
+            func.count().label("count"),
+        )
+        .where(*base_where)
+        .group_by(UsageEvent.path)
+        .order_by(func.count().desc())
+        .limit(top_limit)
+    )
+
+    by_tenant = await db.execute(
+        select(
+            UsageEvent.tenant_id,
+            func.count().label("count"),
+        )
+        .where(*base_where, UsageEvent.tenant_id.is_not(None))
+        .group_by(UsageEvent.tenant_id)
+        .order_by(func.count().desc())
+        .limit(top_limit)
+    )
+
+    return {
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "total_429": int(total or 0),
+        "top_paths": [
+            {"path": r.path, "count": int(r.count)}
+            for r in top_paths.all()
+        ],
+        "by_tenant": [
+            {"tenant_id": str(r.tenant_id), "count": int(r.count)}
+            for r in by_tenant.all()
+        ],
+    }
+
+@router.get(
+    "/tenants/{tenant_id}/usage/rate-limited",
+    dependencies=[Depends(require_admin)],
+)
+async def tenant_rate_limited_usage(
+    tenant_id: uuid.UUID,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    top_limit: int = 10,
+    db: AsyncSession = Depends(get_db),
+):
+    from_ts, to_ts = _resolve_timerange(from_ts, to_ts)
+    top_limit = min(max(top_limit, 1), 50)
+
+    base_where = (
+        UsageEvent.tenant_id == tenant_id,
+        UsageEvent.status_code == 429,
+        UsageEvent.ts >= from_ts,
+        UsageEvent.ts <= to_ts,
+    )
+
+    total = await db.scalar(select(func.count()).where(*base_where))
+
+    by_key = await db.execute(
+        select(
+            UsageEvent.api_key_id,
+            func.count().label("count"),
+        )
+        .where(*base_where, UsageEvent.api_key_id.is_not(None))
+        .group_by(UsageEvent.api_key_id)
+        .order_by(func.count().desc())
+        .limit(top_limit)
+    )
+
+    top_paths = await db.execute(
+        select(
+            UsageEvent.path,
+            func.count().label("count"),
+        )
+        .where(*base_where)
+        .group_by(UsageEvent.path)
+        .order_by(func.count().desc())
+        .limit(top_limit)
+    )
+
+    return {
+        "tenant_id": str(tenant_id),
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "total_429": int(total or 0),
+        "by_key": [
+            {"api_key_id": str(r.api_key_id), "count": int(r.count)}
+            for r in by_key.all()
+        ],
+        "top_paths": [
+            {"path": r.path, "count": int(r.count)}
+            for r in top_paths.all()
+        ],
+    }
+
+@router.get(
+    "/tenants/{tenant_id}/keys/near-quota",
+    dependencies=[Depends(require_admin)],
+)
+async def keys_near_quota(
+    tenant_id: uuid.UUID,
+    threshold: float = 0.8,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
+    if not (0 < threshold <= 1):
+        raise HTTPException(status_code=400, detail="threshold must be (0, 1]")
+
+    limit = min(max(limit, 1), 50)
+    now = datetime.now(timezone.utc)
+
+    keys = await db.execute(
+        select(ApiKey).where(
+            ApiKey.tenant_id == tenant_id,
+            ApiKey.revoked_at.is_(None),
+        )
+    )
+    keys = keys.scalars().all()
+
+    results = []
+
+    for key in keys:
+        if not key.rate_limit or not key.rate_window:
+            continue
+
+        window_start = now - timedelta(seconds=key.rate_window)
+
+        count = await db.scalar(
+            select(func.count())
+            .where(
+                UsageEvent.api_key_id == key.id,
+                UsageEvent.ts >= window_start,
+            )
+        )
+
+        usage_ratio = (count or 0) / key.rate_limit
+
+        if usage_ratio >= threshold:
+            results.append(
+                {
+                    "api_key_id": str(key.id),
+                    "key_prefix": key.key_prefix,
+                    "requests_in_window": int(count or 0),
+                    "rate_limit": key.rate_limit,
+                    "utilization": round(usage_ratio, 2),
+                }
+            )
+
+    results.sort(key=lambda r: r["utilization"], reverse=True)
+
+    return {
+        "tenant_id": str(tenant_id),
+        "threshold": threshold,
+        "keys": results[:limit],
+    }
