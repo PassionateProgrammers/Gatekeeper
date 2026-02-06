@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, case
+from sqlalchemy import select, func, case, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gatekeeper.deps.admin_auth import require_admin
@@ -282,3 +282,40 @@ async def usage_status_classes(
         "4xx": row[1] or 0,
         "5xx": row[2] or 0,
     }
+
+
+@router.get("/tenants/{tenant_id}/usage/events", dependencies=[Depends(require_admin)])
+async def list_usage_events(
+    tenant_id: uuid.UUID,
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    limit = min(max(limit, 1), 200)
+    offset = max(offset, 0)
+
+    result = await db.execute(
+        select(UsageEvent)
+        .where(UsageEvent.tenant_id == tenant_id)
+        .order_by(desc(UsageEvent.ts))
+        .limit(limit)
+        .offset(offset)
+    )
+
+    events = result.scalars().all()
+
+    return [
+        {
+            "id": str(e.id),
+            "ts": e.ts,
+            "api_key_id": str(e.api_key_id),
+            "method": e.method,
+            "path": e.path,
+            "status_code": e.status_code,
+            "latency_ms": e.latency_ms,
+            "request_id": e.request_id,
+            "client_ip": e.client_ip,
+            "user_agent": e.user_agent,
+        }
+        for e in events
+    ]
