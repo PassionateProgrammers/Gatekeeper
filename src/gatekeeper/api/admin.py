@@ -315,7 +315,7 @@ async def list_usage_events(
         {
             "id": str(e.id),
             "ts": e.ts,
-            "api_key_id": str(e.api_key_id),
+            "api_key_id": str(e.api_key_id) if e.api_key_id else None,
             "method": e.method,
             "path": e.path,
             "status_code": e.status_code,
@@ -329,40 +329,24 @@ async def list_usage_events(
 
 
 @router.post("/keys/{key_id}/limits", dependencies=[Depends(require_admin)])
-async def set_key_limits(
-    key_id: uuid.UUID,
-    payload: ApiKeyLimitsIn,
-    db: AsyncSession = Depends(get_db),
-):
+async def set_key_limits(key_id: uuid.UUID, payload: ApiKeyLimitsIn, db: AsyncSession = Depends(get_db)):
     api_key = await db.get(ApiKey, key_id)
     if not api_key:
         raise HTTPException(status_code=404, detail="Key not found")
-
-    if api_key.revoked_at:
-        raise HTTPException(status_code=409, detail="Key is revoked")
 
     api_key.rate_limit = payload.rate_limit
     api_key.rate_window = payload.rate_window
     await db.commit()
     await db.refresh(api_key)
 
-    return {
-        "status": "ok",
-        "key_id": str(api_key.id),
-        "rate_limit": api_key.rate_limit,
-        "rate_window": api_key.rate_window,
-    }
+    return {"status": "ok", "key_id": str(api_key.id), "rate_limit": api_key.rate_limit, "rate_window": api_key.rate_window}
 
 
 @router.post("/keys/{key_id}/tier", dependencies=[Depends(require_admin)])
-async def set_key_tier(
-    key_id: uuid.UUID,
-    payload: ApiKeyTierIn,
-    db: AsyncSession = Depends(get_db),
-):
-    tier = payload.tier.strip().lower()
+async def set_key_tier(key_id: uuid.UUID, payload: ApiKeyTierIn, db: AsyncSession = Depends(get_db)):
+    tier = payload.tier.lower().strip()
     if tier not in TIERS:
-        raise HTTPException(status_code=400, detail=f"Unknown tier. Use one of: {', '.join(TIERS.keys())}")
+        raise HTTPException(status_code=400, detail=f"Unknown tier: {tier}")
 
     api_key = await db.get(ApiKey, key_id)
     if not api_key:
@@ -382,4 +366,189 @@ async def set_key_tier(
         "tier": tier,
         "rate_limit": api_key.rate_limit,
         "rate_window": api_key.rate_window,
+    }
+
+
+def _resolve_timerange(from_ts: datetime | None, to_ts: datetime | None, default_hours: int = 24) -> tuple[datetime, datetime]:
+    """Normalize timerange query params (UTC) and apply sane defaults."""
+    if not to_ts:
+        to_ts = datetime.now(timezone.utc)
+    if not from_ts:
+        from_ts = to_ts - timedelta(hours=default_hours)
+    # Ensure tz-aware
+    if from_ts.tzinfo is None:
+        from_ts = from_ts.replace(tzinfo=timezone.utc)
+    if to_ts.tzinfo is None:
+        to_ts = to_ts.replace(tzinfo=timezone.utc)
+    if from_ts > to_ts:
+        raise HTTPException(status_code=400, detail="from_ts must be <= to_ts")
+    return from_ts, to_ts
+
+
+@router.get("/usage/unauth", dependencies=[Depends(require_admin)])
+async def unauth_usage(
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    top_limit: int = 10,
+    db: AsyncSession = Depends(get_db),
+):
+    """Global view of unauthenticated traffic (tenant_id/api_key_id are NULL)."""
+    from_ts, to_ts = _resolve_timerange(from_ts, to_ts, default_hours=24)
+    top_limit = min(max(top_limit, 1), 50)
+
+    base_where = (
+        UsageEvent.tenant_id.is_(None),
+        UsageEvent.ts >= from_ts,
+        UsageEvent.ts <= to_ts,
+    )
+
+    total_result = await db.execute(select(func.count()).where(*base_where))
+    total = int(total_result.scalar() or 0)
+
+    by_status_result = await db.execute(
+        select(
+            UsageEvent.status_code,
+            func.count().label("count"),
+            func.avg(UsageEvent.latency_ms).label("avg_latency"),
+        )
+        .where(*base_where)
+        .group_by(UsageEvent.status_code)
+        .order_by(UsageEvent.status_code.asc())
+    )
+    by_status_rows = by_status_result.all()
+
+    top_paths_result = await db.execute(
+        select(
+            UsageEvent.path,
+            func.count().label("count"),
+            func.sum(case((UsageEvent.status_code >= 400, 1), else_=0)).label("errors"),
+        )
+        .where(*base_where)
+        .group_by(UsageEvent.path)
+        .order_by(func.count().desc())
+        .limit(top_limit)
+    )
+    top_paths_rows = top_paths_result.all()
+
+    top_ips_result = await db.execute(
+        select(
+            UsageEvent.client_ip,
+            func.count().label("count"),
+            func.sum(case((UsageEvent.status_code == 401, 1), else_=0)).label("unauth_401"),
+        )
+        .where(*base_where)
+        .group_by(UsageEvent.client_ip)
+        .order_by(func.count().desc())
+        .limit(top_limit)
+    )
+    top_ips_rows = top_ips_result.all()
+
+    avg_latency_ms = 0.0
+    if by_status_rows:
+        avg_latency_ms = round(
+            sum((r.avg_latency or 0) for r in by_status_rows) / max(len(by_status_rows), 1), 2
+        )
+
+    return {
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "total": total,
+        "by_status": {str(r.status_code): int(r.count) for r in by_status_rows},
+        "avg_latency_ms": avg_latency_ms,
+        "top_paths": [
+            {
+                "path": r.path,
+                "count": int(r.count),
+                "error_rate": round((int(r.errors or 0)) / max(int(r.count), 1), 2),
+            }
+            for r in top_paths_rows
+        ],
+        "top_ips": [
+            {
+                "client_ip": r.client_ip,
+                "count": int(r.count),
+                "unauth_401": int(r.unauth_401 or 0),
+            }
+            for r in top_ips_rows
+        ],
+    }
+
+
+@router.get("/abuse/suspects", dependencies=[Depends(require_admin)])
+async def abuse_suspects(
+    window_minutes: int = 10,
+    min_unauth_401: int = 20,
+    limit: int = 20,
+    db: AsyncSession = Depends(get_db),
+):
+    """Lightweight abuse detection: IPs with high unauth 401 volume in a rolling window."""
+    window_minutes = min(max(window_minutes, 1), 24 * 60)
+    min_unauth_401 = min(max(min_unauth_401, 1), 1_000_000)
+    limit = min(max(limit, 1), 200)
+
+    to_ts = datetime.now(timezone.utc)
+    from_ts = to_ts - timedelta(minutes=window_minutes)
+
+    base_where = (
+        UsageEvent.tenant_id.is_(None),
+        UsageEvent.status_code == 401,
+        UsageEvent.ts >= from_ts,
+        UsageEvent.ts <= to_ts,
+    )
+
+    suspects_result = await db.execute(
+        select(
+            UsageEvent.client_ip.label("client_ip"),
+            func.count().label("unauth_401_count"),
+            func.min(UsageEvent.ts).label("first_seen"),
+            func.max(UsageEvent.ts).label("last_seen"),
+        )
+        .where(*base_where)
+        .group_by(UsageEvent.client_ip)
+        .having(func.count() >= min_unauth_401)
+        .order_by(func.count().desc())
+        .limit(limit)
+    )
+    suspects = suspects_result.all()
+
+    ips = [s.client_ip for s in suspects]
+    top_paths_by_ip: dict[str, list[dict]] = {ip: [] for ip in ips}
+
+    if ips:
+        paths_result = await db.execute(
+            select(
+                UsageEvent.client_ip.label("client_ip"),
+                UsageEvent.path.label("path"),
+                func.count().label("count"),
+            )
+            .where(*base_where, UsageEvent.client_ip.in_(ips))
+            .group_by(UsageEvent.client_ip, UsageEvent.path)
+            .order_by(UsageEvent.client_ip.asc(), func.count().desc())
+        )
+        rows = paths_result.all()
+
+        # Keep top 3 paths per IP
+        for r in rows:
+            bucket = top_paths_by_ip.get(r.client_ip)
+            if bucket is None:
+                continue
+            if len(bucket) >= 3:
+                continue
+            bucket.append({"path": r.path, "count": int(r.count)})
+
+    return {
+        "window_minutes": window_minutes,
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "min_unauth_401": min_unauth_401,
+        "suspects": [
+            {
+                "client_ip": s.client_ip,
+                "unauth_401_count": int(s.unauth_401_count),
+                "first_seen": s.first_seen,
+                "last_seen": s.last_seen,
+                "top_paths": top_paths_by_ip.get(s.client_ip, []),
+            }
+            for s in suspects
+        ],
     }
