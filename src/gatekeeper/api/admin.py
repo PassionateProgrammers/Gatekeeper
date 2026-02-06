@@ -196,3 +196,43 @@ async def top_endpoints(
         }
         for r in rows
     ]
+    
+@router.get("/tenants/{tenant_id}/usage/by-key", dependencies=[Depends(require_admin)])
+async def usage_by_key(
+    tenant_id: uuid.UUID,
+    from_ts: datetime | None = None,
+    to_ts: datetime | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    if not to_ts:
+        to_ts = datetime.now(timezone.utc)
+    if not from_ts:
+        from_ts = to_ts - timedelta(hours=24)
+
+    result = await db.execute(
+        select(
+            UsageEvent.api_key_id,
+            func.count().label("count"),
+            func.sum(
+                case((UsageEvent.status_code >= 400, 1), else_=0)
+            ).label("errors"),
+        )
+        .where(
+            UsageEvent.tenant_id == tenant_id,
+            UsageEvent.ts >= from_ts,
+            UsageEvent.ts <= to_ts,
+        )
+        .group_by(UsageEvent.api_key_id)
+        .order_by(func.count().desc())
+    )
+
+    rows = result.all()
+
+    return [
+        {
+            "api_key_id": str(r.api_key_id),
+            "count": r.count,
+            "error_rate": round((r.errors or 0) / r.count, 2),
+        }
+        for r in rows
+    ]
