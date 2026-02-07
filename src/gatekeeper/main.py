@@ -17,6 +17,7 @@ app = FastAPI(title="Gatekeeper", version="0.1.0")
 
 app.add_middleware(UsageLoggingMiddleware)
 app.add_middleware(RequestIdMiddleware)
+app.add_middleware(IPBlocklistMiddleware)
 app.include_router(health_router)
 app.include_router(admin_router)
 app.include_router(gateway_router)

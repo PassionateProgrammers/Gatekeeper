@@ -12,6 +12,8 @@ from gatekeeper.models.tenant import Tenant
 from gatekeeper.models.api_key import ApiKey
 from gatekeeper.models.usage_event import UsageEvent
 from gatekeeper.core.keys import generate_plaintext_key, hash_key, key_prefix
+from gatekeeper.deps.redis import get_redis
+from redis.asyncio import Redis
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -37,9 +39,16 @@ class ApiKeyLimitsIn(BaseModel):
     rate_window: int = Field(ge=1, le=86_400)
 
 
-# NEW
 class ApiKeyTierIn(BaseModel):
     tier: str = Field(min_length=1, max_length=32)
+    
+class BlockIpIn(BaseModel):
+    client_ip: str = Field(min_length=1, max_length=128)
+    ttl_seconds: int = Field(ge=10, le=7 * 24 * 3600)  # 10s .. 7 days
+    reason: str = Field(default="manual", max_length=200)
+
+class UnblockIpIn(BaseModel):
+    client_ip: str = Field(min_length=1, max_length=128)
 
 
 TIERS = {
@@ -728,3 +737,179 @@ async def keys_near_quota(
         "threshold": threshold,
         "keys": results[:limit],
     }
+    
+    
+@router.get("/abuse/ip/{client_ip}", dependencies=[Depends(require_admin)])
+async def ip_timeline(
+    client_ip: str,
+    minutes: int = 60,
+    limit: int = 200,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Timeline view for a single IP:
+    - last N events in a rolling window
+    - status breakdown + top paths
+    """
+    minutes = min(max(minutes, 1), 24 * 60)
+    limit = min(max(limit, 1), 500)
+
+    to_ts = datetime.now(timezone.utc)
+    from_ts = to_ts - timedelta(minutes=minutes)
+
+    where = (
+        UsageEvent.client_ip == client_ip,
+        UsageEvent.ts >= from_ts,
+        UsageEvent.ts <= to_ts,
+    )
+
+    # Status breakdown
+    status_rows = (
+        await db.execute(
+            select(
+                UsageEvent.status_code,
+                func.count().label("count"),
+            )
+            .where(*where)
+            .group_by(UsageEvent.status_code)
+            .order_by(UsageEvent.status_code.asc())
+        )
+    ).all()
+
+    # Quick signals: unauth vs rate-limited vs success
+    signals = (
+        await db.execute(
+            select(
+                func.sum(
+                    case((UsageEvent.tenant_id.is_(None), 1), else_=0)
+                ).label("unauth_rows"),
+                func.sum(
+                    case((UsageEvent.status_code == 401, 1), else_=0)
+                ).label("unauth_401"),
+                func.sum(
+                    case((UsageEvent.status_code == 429, 1), else_=0)
+                ).label("rate_limited_429"),
+                func.sum(
+                    case((UsageEvent.status_code.between(200, 299), 1), else_=0)
+                ).label("success_2xx"),
+            )
+            .where(*where)
+        )
+    ).one()
+
+    # Top paths (within window)
+    top_paths = (
+        await db.execute(
+            select(
+                UsageEvent.path,
+                func.count().label("count"),
+            )
+            .where(*where)
+            .group_by(UsageEvent.path)
+            .order_by(func.count().desc())
+            .limit(10)
+        )
+    ).all()
+
+    # Timeline events
+    events = (
+        await db.execute(
+            select(UsageEvent)
+            .where(*where)
+            .order_by(desc(UsageEvent.ts))
+            .limit(limit)
+        )
+    ).scalars().all()
+
+    return {
+        "client_ip": client_ip,
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "counts": {
+            "total": sum(int(r.count) for r in status_rows),
+            "unauth_rows": int(signals.unauth_rows or 0),
+            "unauth_401": int(signals.unauth_401 or 0),
+            "rate_limited_429": int(signals.rate_limited_429 or 0),
+            "success_2xx": int(signals.success_2xx or 0),
+        },
+        "by_status": {str(r.status_code): int(r.count) for r in status_rows},
+        "top_paths": [{"path": r.path, "count": int(r.count)} for r in top_paths],
+        "events": [
+            {
+                "ts": e.ts,
+                "tenant_id": str(e.tenant_id) if e.tenant_id else None,
+                "api_key_id": str(e.api_key_id) if e.api_key_id else None,
+                "method": e.method,
+                "path": e.path,
+                "status_code": e.status_code,
+                "latency_ms": e.latency_ms,
+                "request_id": e.request_id,
+                "user_agent": e.user_agent,
+            }
+            for e in events
+        ],
+    }
+
+BLOCK_IP_PREFIX = "blk:ip:"
+
+
+@router.post("/abuse/block-ip", dependencies=[Depends(require_admin)])
+async def block_ip(
+    payload: BlockIpIn,
+    r: Redis = Depends(get_redis),
+):
+    key = f"{BLOCK_IP_PREFIX}{payload.client_ip}"
+    await r.set(key, payload.reason, ex=payload.ttl_seconds)
+
+    ttl = await r.ttl(key)
+    return {
+        "status": "blocked",
+        "client_ip": payload.client_ip,
+        "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
+        "reason": payload.reason,
+    }
+
+
+@router.post("/abuse/unblock-ip", dependencies=[Depends(require_admin)])
+async def unblock_ip(
+    payload: UnblockIpIn,
+    r: Redis = Depends(get_redis),
+):
+    key = f"{BLOCK_IP_PREFIX}{payload.client_ip}"
+    deleted = await r.delete(key)
+    return {
+        "status": "unblocked",
+        "client_ip": payload.client_ip,
+        "deleted": bool(deleted),
+    }
+
+
+@router.get("/abuse/blocked", dependencies=[Depends(require_admin)])
+async def list_blocked_ips(
+    limit: int = 200,
+    r: Redis = Depends(get_redis),
+):
+    limit = min(max(limit, 1), 1000)
+
+    blocked = []
+    count = 0
+
+    async for key in r.scan_iter(match=f"{BLOCK_IP_PREFIX}*"):
+        if count >= limit:
+            break
+        ip = key.replace(BLOCK_IP_PREFIX, "", 1)
+        ttl = await r.ttl(key)
+        reason = await r.get(key)
+        blocked.append(
+            {
+                "client_ip": ip,
+                "ttl_seconds": int(ttl) if ttl and ttl > 0 else None,
+                "reason": reason,
+            }
+        )
+        count += 1
+
+    # Sort: shortest TTL first (nice for operators)
+    blocked.sort(key=lambda x: (x["ttl_seconds"] is None, x["ttl_seconds"] or 10**9))
+
+    return {"count": len(blocked), "blocked": blocked}
