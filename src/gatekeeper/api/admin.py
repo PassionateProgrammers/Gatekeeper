@@ -87,6 +87,18 @@ TIERS = {
 
 BLOCK_IP_PREFIX = "blk:ip:"
 BLOCK_IP_INDEX_KEY = "blk:index"  # ZSET: member=ip, score=expiry_epoch
+BLOCK_EVENTS_KEY = "blk:events"  # Redis LIST of JSON events (most recent at head)
+BLOCK_EVENTS_MAX = 5000
+
+
+async def _push_block_event(r: Redis, event: dict) -> None:
+    # LPUSH newest; trim to cap
+    payload = json.dumps(event)
+    pipe = r.pipeline()
+    pipe.lpush(BLOCK_EVENTS_KEY, payload)
+    pipe.ltrim(BLOCK_EVENTS_KEY, 0, BLOCK_EVENTS_MAX - 1)
+    await pipe.execute()
+
 
 ALLOWED_REASON_CODES = {
     "manual",
@@ -935,6 +947,20 @@ async def block_ip(
     pipe.set(key, value, ex=payload.ttl_seconds)
     pipe.zadd(BLOCK_IP_INDEX_KEY, {payload.client_ip: expires_at_epoch})
     await pipe.execute()
+    
+    await _push_block_event(
+        r,
+        {
+            "event_type": "block",
+            "ts_epoch": created_at_epoch,
+            "client_ip": payload.client_ip,
+            "block_id": block_id,
+            "reason_code": reason_code,
+            "reason": payload.reason,
+            "expires_at_epoch": expires_at_epoch,
+            "actor": "admin_api",
+        },
+    )
 
     ttl = await r.ttl(key)
     return {
@@ -959,6 +985,18 @@ async def unblock_ip(
     pipe.delete(key)
     pipe.zrem(BLOCK_IP_INDEX_KEY, payload.client_ip)
     deleted_key, removed_index = await pipe.execute()
+    
+    await _push_block_event(
+        r,
+        {
+            "event_type": "unblock",
+            "ts_epoch": int(datetime.now(timezone.utc).timestamp()),
+            "client_ip": payload.client_ip,
+            "actor": "admin_api",
+            "deleted": bool(deleted_key),
+            "removed_from_index": bool(removed_index),
+        },
+    )
 
     return {
         "status": "unblocked",
@@ -1137,6 +1175,7 @@ async def auto_block_from_suspects(
     for s in suspects:
         ip = s.client_ip
 
+        # Safety: don't block localhost unless explicitly allowed
         if ip in ("127.0.0.1", "::1") and (not payload.include_localhost) and (not settings.allow_block_localhost):
             skipped.append({"client_ip": ip, "reason": "localhost_block_protection"})
             continue
@@ -1174,6 +1213,20 @@ async def auto_block_from_suspects(
         pipe.set(key, value, ex=payload.ttl_seconds)
         pipe.zadd(BLOCK_IP_INDEX_KEY, {ip: expires_at_epoch})
         await pipe.execute()
+
+        await _push_block_event(
+            r,
+            {
+                "event_type": "block",
+                "ts_epoch": created_at_epoch,
+                "client_ip": ip,
+                "block_id": block_id,
+                "reason_code": reason_code,
+                "reason": payload.reason,
+                "expires_at_epoch": expires_at_epoch,
+                "actor": "auto_block",
+            },
+        )
 
         ttl = await r.ttl(key)
 
@@ -1248,6 +1301,7 @@ async def block_top_suspects(
     for s in suspects:
         ip = s.client_ip
 
+        # Safety: don't block localhost unless explicitly allowed
         if ip in ("127.0.0.1", "::1") and (not payload.include_localhost) and (not settings.allow_block_localhost):
             skipped.append({"client_ip": ip, "reason": "localhost_block_protection"})
             continue
@@ -1286,6 +1340,21 @@ async def block_top_suspects(
         pipe.zadd(BLOCK_IP_INDEX_KEY, {ip: expires_at_epoch})
         await pipe.execute()
 
+        # NEW: audit event (log immediately after write)
+        await _push_block_event(
+            r,
+            {
+                "event_type": "block",
+                "ts_epoch": created_at_epoch,
+                "client_ip": ip,
+                "block_id": block_id,
+                "reason_code": reason_code,
+                "reason": payload.reason,
+                "expires_at_epoch": expires_at_epoch,
+                "actor": "one_click",
+            },
+        )
+
         ttl = await r.ttl(key)
 
         blocked.append(
@@ -1312,4 +1381,32 @@ async def block_top_suspects(
         "skipped_count": len(skipped),
         "blocked": blocked,
         "skipped": skipped,
+    }
+
+    
+@router.get("/abuse/blocks/events", dependencies=[Depends(require_admin)])
+async def block_events(
+    limit: int = 100,
+    offset: int = 0,
+    r: Redis = Depends(get_redis),
+):
+    limit = min(max(limit, 1), 500)
+    offset = max(offset, 0)
+
+    # LRANGE is inclusive end
+    items = await r.lrange(BLOCK_EVENTS_KEY, offset, offset + limit - 1)
+
+    events = []
+    for raw in items:
+        raw_s = _to_str(raw)
+        try:
+            events.append(json.loads(raw_s))
+        except Exception:
+            events.append({"event_type": "unknown", "raw": raw_s})
+
+    return {
+        "limit": limit,
+        "offset": offset,
+        "count": len(events),
+        "events": events,
     }
