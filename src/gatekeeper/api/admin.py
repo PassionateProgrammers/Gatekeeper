@@ -861,6 +861,8 @@ async def ip_timeline(
     }
 
 BLOCK_IP_PREFIX = "blk:ip:"
+BLOCK_IP_PREFIX = "blk:ip:"
+BLOCK_IP_INDEX_KEY = "blk:index"  # ZSET: member=ip, score=expiry_epoch
 
 
 @router.post("/abuse/block-ip", dependencies=[Depends(require_admin)])
@@ -869,7 +871,13 @@ async def block_ip(
     r: Redis = Depends(get_redis),
 ):
     key = f"{BLOCK_IP_PREFIX}{payload.client_ip}"
-    await r.set(key, payload.reason, ex=payload.ttl_seconds)
+    now = datetime.now(timezone.utc)
+    expiry_epoch = int((now + timedelta(seconds=payload.ttl_seconds)).timestamp())
+
+    pipe = r.pipeline()
+    pipe.set(key, payload.reason, ex=payload.ttl_seconds)
+    pipe.zadd(BLOCK_IP_INDEX_KEY, {payload.client_ip: expiry_epoch})
+    await pipe.execute()
 
     ttl = await r.ttl(key)
     return {
@@ -877,6 +885,7 @@ async def block_ip(
         "client_ip": payload.client_ip,
         "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
         "reason": payload.reason,
+        "expires_at_epoch": expiry_epoch,
     }
 
 
@@ -886,11 +895,17 @@ async def unblock_ip(
     r: Redis = Depends(get_redis),
 ):
     key = f"{BLOCK_IP_PREFIX}{payload.client_ip}"
-    deleted = await r.delete(key)
+
+    pipe = r.pipeline()
+    pipe.delete(key)
+    pipe.zrem(BLOCK_IP_INDEX_KEY, payload.client_ip)
+    deleted_key, removed_index = await pipe.execute()
+
     return {
         "status": "unblocked",
         "client_ip": payload.client_ip,
-        "deleted": bool(deleted),
+        "deleted": bool(deleted_key),
+        "removed_from_index": bool(removed_index),
     }
 
 
@@ -923,8 +938,6 @@ async def list_blocked_ips(
     blocked.sort(key=lambda x: (x["ttl_seconds"] is None, x["ttl_seconds"] or 10**9))
 
     return {"count": len(blocked), "blocked": blocked}
-
-BLOCK_IP_PREFIX = "blk:ip:"
 
 
 @router.post("/abuse/auto-block", dependencies=[Depends(require_admin)])
@@ -988,7 +1001,14 @@ async def auto_block_from_suspects(
             )
             continue
 
-        await r.set(key, payload.reason, ex=payload.ttl_seconds)
+        now = datetime.now(timezone.utc)
+        expiry_epoch = int((now + timedelta(seconds=payload.ttl_seconds)).timestamp())
+
+        pipe = r.pipeline()
+        pipe.set(key, payload.reason, ex=payload.ttl_seconds)
+        pipe.zadd(BLOCK_IP_INDEX_KEY, {ip: expiry_epoch})
+        await pipe.execute()
+
         ttl = await r.ttl(key)
 
         blocked.append(
@@ -1012,6 +1032,91 @@ async def auto_block_from_suspects(
         "blocked_count": len(blocked),
         "skipped_count": len(skipped),
         "blocked": blocked,
+        "expires_at_epoch": expiry_epoch,
         "skipped": skipped,
+    }
+    
+    
+@router.get("/abuse/blocked/{client_ip}", dependencies=[Depends(require_admin)])
+async def blocked_details(
+    client_ip: str,
+    r: Redis = Depends(get_redis),
+):
+    key = f"{BLOCK_IP_PREFIX}{client_ip}"
+    reason = await r.get(key)
+    if reason is None:
+        return {"client_ip": client_ip, "blocked": False}
+
+    ttl = await r.ttl(key)
+    return {
+        "client_ip": client_ip,
+        "blocked": True,
+        "reason": reason,
+        "ttl_seconds": int(ttl) if ttl and ttl > 0 else None,
+    }
+
+
+@router.get("/abuse/blocks/report", dependencies=[Depends(require_admin)])
+async def blocks_report(
+    lookback_minutes: int = 60,
+    limit: int = 200,
+    r: Redis = Depends(get_redis),
+):
+    lookback_minutes = min(max(lookback_minutes, 1), 7 * 24 * 60)
+    limit = min(max(limit, 1), 1000)
+
+    now = datetime.now(timezone.utc)
+    now_epoch = int(now.timestamp())
+    since_epoch = now_epoch - (lookback_minutes * 60)
+
+    # Pull relevant IPs from the index (both active and recently expired by score window)
+    ips = await r.zrangebyscore(BLOCK_IP_INDEX_KEY, since_epoch, now_epoch + 10**9)
+    ips = ips[:limit]
+
+    active = []
+    expired_recently = []
+    stale = []
+
+    for ip in ips:
+        key = f"{BLOCK_IP_PREFIX}{ip}"
+        reason = await r.get(key)
+        ttl = await r.ttl(key)
+        expiry_epoch = await r.zscore(BLOCK_IP_INDEX_KEY, ip)
+
+        if reason is None:
+            # Key is gone: either expired or was manually unblocked but not removed (stale)
+            if expiry_epoch is not None and int(expiry_epoch) >= since_epoch:
+                expired_recently.append(
+                    {"client_ip": ip, "expired_at_epoch": int(expiry_epoch)}
+                )
+            else:
+                stale.append(ip)
+            continue
+
+        active.append(
+            {
+                "client_ip": ip,
+                "reason": reason,
+                "ttl_seconds": int(ttl) if ttl and ttl > 0 else None,
+                "expires_at_epoch": int(expiry_epoch) if expiry_epoch is not None else None,
+            }
+        )
+
+    # Cleanup stale index entries (optional but keeps index honest)
+    if stale:
+        await r.zrem(BLOCK_IP_INDEX_KEY, *stale)
+
+    # Sort for operator sanity
+    active.sort(key=lambda x: (x["ttl_seconds"] is None, x["ttl_seconds"] or 10**9))
+    expired_recently.sort(key=lambda x: x["expired_at_epoch"], reverse=True)
+
+    return {
+        "lookback_minutes": lookback_minutes,
+        "now_epoch": now_epoch,
+        "active_count": len(active),
+        "expired_recently_count": len(expired_recently),
+        "active": active,
+        "expired_recently": expired_recently[:limit],
+        "cleaned_stale_index_members": len(stale),
     }
 
