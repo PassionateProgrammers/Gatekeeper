@@ -43,13 +43,16 @@ class ApiKeyLimitsIn(BaseModel):
 class ApiKeyTierIn(BaseModel):
     tier: str = Field(min_length=1, max_length=32)
     
+    
 class BlockIpIn(BaseModel):
     client_ip: str = Field(min_length=1, max_length=128)
     ttl_seconds: int = Field(ge=10, le=7 * 24 * 3600)  # 10s .. 7 days
     reason: str = Field(default="manual", max_length=200)
 
+
 class UnblockIpIn(BaseModel):
     client_ip: str = Field(min_length=1, max_length=128)
+   
     
 class AutoBlockFromSuspectsIn(BaseModel):
     window_minutes: int = Field(default=10, ge=1, le=24 * 60)
@@ -59,6 +62,16 @@ class AutoBlockFromSuspectsIn(BaseModel):
     dry_run: bool = True
     include_localhost: bool = False
     limit: int = Field(default=50, ge=1, le=500)
+    
+    
+class BlockSuspectsIn(BaseModel):
+    window_minutes: int = Field(default=10, ge=1, le=24 * 60)
+    min_unauth_401: int = Field(default=50, ge=1, le=1_000_000)
+    top_n: int = Field(default=10, ge=1, le=200)
+    ttl_seconds: int = Field(default=600, ge=10, le=7 * 24 * 3600)
+    reason: str = Field(default="one-click: suspects", max_length=200)
+    dry_run: bool = True
+    include_localhost: bool = False
 
 
 TIERS = {
@@ -1119,4 +1132,98 @@ async def blocks_report(
         "expired_recently": expired_recently[:limit],
         "cleaned_stale_index_members": len(stale),
     }
+ 
+    
+@router.post("/abuse/suspects/block", dependencies=[Depends(require_admin)])
+async def block_top_suspects(
+    payload: BlockSuspectsIn,
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
+):
+    if not settings.enable_auto_block:
+        raise HTTPException(
+            status_code=409,
+            detail="Auto-block is disabled. Set ENABLE_AUTO_BLOCK=true to enable.",
+        )
 
+    to_ts = datetime.now(timezone.utc)
+    from_ts = to_ts - timedelta(minutes=payload.window_minutes)
+
+    base_where = (
+        UsageEvent.tenant_id.is_(None),
+        UsageEvent.status_code == 401,
+        UsageEvent.ts >= from_ts,
+        UsageEvent.ts <= to_ts,
+    )
+
+    suspects_result = await db.execute(
+        select(
+            UsageEvent.client_ip.label("client_ip"),
+            func.count().label("unauth_401_count"),
+        )
+        .where(*base_where)
+        .group_by(UsageEvent.client_ip)
+        .having(func.count() >= payload.min_unauth_401)
+        .order_by(func.count().desc())
+        .limit(payload.top_n)
+    )
+    suspects = suspects_result.all()
+
+    blocked = []
+    skipped = []
+
+    for s in suspects:
+        ip = s.client_ip
+
+        # Safety: don't block localhost unless explicitly allowed
+        if ip in ("127.0.0.1", "::1") and (not payload.include_localhost) and (not settings.allow_block_localhost):
+            skipped.append({"client_ip": ip, "reason": "localhost_block_protection"})
+            continue
+
+        now = datetime.now(timezone.utc)
+        expiry_epoch = int((now + timedelta(seconds=payload.ttl_seconds)).timestamp())
+
+        if payload.dry_run:
+            blocked.append(
+                {
+                    "client_ip": ip,
+                    "unauth_401_count": int(s.unauth_401_count),
+                    "ttl_seconds": payload.ttl_seconds,
+                    "expires_at_epoch": expiry_epoch,
+                    "reason": payload.reason,
+                    "dry_run": True,
+                }
+            )
+            continue
+
+        key = f"{BLOCK_IP_PREFIX}{ip}"
+        pipe = r.pipeline()
+        pipe.set(key, payload.reason, ex=payload.ttl_seconds)
+        pipe.zadd(BLOCK_IP_INDEX_KEY, {ip: expiry_epoch})
+        await pipe.execute()
+
+        ttl = await r.ttl(key)
+
+        blocked.append(
+            {
+                "client_ip": ip,
+                "unauth_401_count": int(s.unauth_401_count),
+                "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
+                "expires_at_epoch": expiry_epoch,
+                "reason": payload.reason,
+                "dry_run": False,
+            }
+        )
+
+    return {
+        "dry_run": payload.dry_run,
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "min_unauth_401": payload.min_unauth_401,
+        "top_n": payload.top_n,
+        "ttl_seconds": payload.ttl_seconds,
+        "blocked_count": len(blocked),
+        "skipped_count": len(skipped),
+        "blocked": blocked,
+        "skipped": skipped,
+    }
