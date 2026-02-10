@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, func, case, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from gatekeeper.config import settings
 from gatekeeper.deps.admin_auth import require_admin
 from gatekeeper.deps.db import get_db
 from gatekeeper.models.tenant import Tenant
@@ -49,6 +50,15 @@ class BlockIpIn(BaseModel):
 
 class UnblockIpIn(BaseModel):
     client_ip: str = Field(min_length=1, max_length=128)
+    
+class AutoBlockFromSuspectsIn(BaseModel):
+    window_minutes: int = Field(default=10, ge=1, le=24 * 60)
+    min_unauth_401: int = Field(default=50, ge=1, le=1_000_000)
+    ttl_seconds: int = Field(default=600, ge=10, le=7 * 24 * 3600)  # 10s .. 7d
+    reason: str = Field(default="auto: unauth_401 surge", max_length=200)
+    dry_run: bool = True
+    include_localhost: bool = False
+    limit: int = Field(default=50, ge=1, le=500)
 
 
 TIERS = {
@@ -913,3 +923,95 @@ async def list_blocked_ips(
     blocked.sort(key=lambda x: (x["ttl_seconds"] is None, x["ttl_seconds"] or 10**9))
 
     return {"count": len(blocked), "blocked": blocked}
+
+BLOCK_IP_PREFIX = "blk:ip:"
+
+
+@router.post("/abuse/auto-block", dependencies=[Depends(require_admin)])
+async def auto_block_from_suspects(
+    payload: AutoBlockFromSuspectsIn,
+    db: AsyncSession = Depends(get_db),
+    r: Redis = Depends(get_redis),
+):
+    if not settings.enable_auto_block:
+        raise HTTPException(
+            status_code=409,
+            detail="Auto-block is disabled. Set ENABLE_AUTO_BLOCK=true to enable.",
+        )
+
+    to_ts = datetime.now(timezone.utc)
+    from_ts = to_ts - timedelta(minutes=payload.window_minutes)
+
+    base_where = (
+        UsageEvent.tenant_id.is_(None),
+        UsageEvent.status_code == 401,
+        UsageEvent.ts >= from_ts,
+        UsageEvent.ts <= to_ts,
+    )
+
+    suspects_result = await db.execute(
+        select(
+            UsageEvent.client_ip.label("client_ip"),
+            func.count().label("unauth_401_count"),
+            func.min(UsageEvent.ts).label("first_seen"),
+            func.max(UsageEvent.ts).label("last_seen"),
+        )
+        .where(*base_where)
+        .group_by(UsageEvent.client_ip)
+        .having(func.count() >= payload.min_unauth_401)
+        .order_by(func.count().desc())
+        .limit(payload.limit)
+    )
+    suspects = suspects_result.all()
+
+    blocked = []
+    skipped = []
+
+    for s in suspects:
+        ip = s.client_ip
+
+        if ip in ("127.0.0.1", "::1") and (not payload.include_localhost) and (not settings.allow_block_localhost):
+            skipped.append({"client_ip": ip, "reason": "localhost_block_protection"})
+            continue
+
+        key = f"{BLOCK_IP_PREFIX}{ip}"
+
+        if payload.dry_run:
+            blocked.append(
+                {
+                    "client_ip": ip,
+                    "unauth_401_count": int(s.unauth_401_count),
+                    "ttl_seconds": payload.ttl_seconds,
+                    "reason": payload.reason,
+                    "dry_run": True,
+                }
+            )
+            continue
+
+        await r.set(key, payload.reason, ex=payload.ttl_seconds)
+        ttl = await r.ttl(key)
+
+        blocked.append(
+            {
+                "client_ip": ip,
+                "unauth_401_count": int(s.unauth_401_count),
+                "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
+                "reason": payload.reason,
+                "dry_run": False,
+            }
+        )
+
+    return {
+        "enabled": True,
+        "dry_run": payload.dry_run,
+        "window_minutes": payload.window_minutes,
+        "min_unauth_401": payload.min_unauth_401,
+        "ttl_seconds": payload.ttl_seconds,
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "blocked_count": len(blocked),
+        "skipped_count": len(skipped),
+        "blocked": blocked,
+        "skipped": skipped,
+    }
+
