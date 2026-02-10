@@ -1,20 +1,21 @@
 import uuid
+import json
 from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, case, desc
 from sqlalchemy.ext.asyncio import AsyncSession
+from redis.asyncio import Redis
 
 from gatekeeper.config import settings
 from gatekeeper.deps.admin_auth import require_admin
 from gatekeeper.deps.db import get_db
+from gatekeeper.deps.redis import get_redis
 from gatekeeper.models.tenant import Tenant
 from gatekeeper.models.api_key import ApiKey
 from gatekeeper.models.usage_event import UsageEvent
 from gatekeeper.core.keys import generate_plaintext_key, hash_key, key_prefix
-from gatekeeper.deps.redis import get_redis
-from redis.asyncio import Redis
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -42,33 +43,36 @@ class ApiKeyLimitsIn(BaseModel):
 
 class ApiKeyTierIn(BaseModel):
     tier: str = Field(min_length=1, max_length=32)
-    
-    
+
+
 class BlockIpIn(BaseModel):
     client_ip: str = Field(min_length=1, max_length=128)
     ttl_seconds: int = Field(ge=10, le=7 * 24 * 3600)  # 10s .. 7 days
+    reason_code: str = Field(default="manual", max_length=64)
     reason: str = Field(default="manual", max_length=200)
 
 
 class UnblockIpIn(BaseModel):
     client_ip: str = Field(min_length=1, max_length=128)
-   
-    
+
+
 class AutoBlockFromSuspectsIn(BaseModel):
     window_minutes: int = Field(default=10, ge=1, le=24 * 60)
     min_unauth_401: int = Field(default=50, ge=1, le=1_000_000)
-    ttl_seconds: int = Field(default=600, ge=10, le=7 * 24 * 3600)  # 10s .. 7d
+    ttl_seconds: int = Field(default=600, ge=10, le=7 * 24 * 3600)
+    reason_code: str = Field(default="auto_unauth_401_surge", max_length=64)
     reason: str = Field(default="auto: unauth_401 surge", max_length=200)
     dry_run: bool = True
     include_localhost: bool = False
     limit: int = Field(default=50, ge=1, le=500)
-    
-    
+
+
 class BlockSuspectsIn(BaseModel):
     window_minutes: int = Field(default=10, ge=1, le=24 * 60)
     min_unauth_401: int = Field(default=50, ge=1, le=1_000_000)
     top_n: int = Field(default=10, ge=1, le=200)
     ttl_seconds: int = Field(default=600, ge=10, le=7 * 24 * 3600)
+    reason_code: str = Field(default="one_click_suspects", max_length=64)
     reason: str = Field(default="one-click: suspects", max_length=200)
     dry_run: bool = True
     include_localhost: bool = False
@@ -79,6 +83,62 @@ TIERS = {
     "pro": {"rate_limit": 120, "rate_window": 60},
     "enterprise": {"rate_limit": 600, "rate_window": 60},
 }
+
+
+BLOCK_IP_PREFIX = "blk:ip:"
+BLOCK_IP_INDEX_KEY = "blk:index"  # ZSET: member=ip, score=expiry_epoch
+
+ALLOWED_REASON_CODES = {
+    "manual",
+    "operator_action",
+    "auto_unauth_401_surge",
+    "one_click_suspects",
+}
+
+
+def _to_str(x) -> str:
+    if isinstance(x, (bytes, bytearray)):
+        return x.decode("utf-8", errors="replace")
+    return str(x)
+
+
+def _make_block_payload(
+    *,
+    block_id: str,
+    reason_code: str,
+    reason: str,
+    created_at_epoch: int,
+    expires_at_epoch: int,
+) -> str:
+    if reason_code not in ALLOWED_REASON_CODES:
+        reason_code = "manual"
+    return json.dumps(
+        {
+            "block_id": block_id,
+            "reason_code": reason_code,
+            "reason": reason,
+            "created_at_epoch": created_at_epoch,
+            "expires_at_epoch": expires_at_epoch,
+        }
+    )
+
+
+def _parse_block_value(raw) -> dict:
+    """
+    Redis may return bytes. New format stores JSON; old format was plain string reason.
+    Returns dict with keys: block_id, reason_code, reason, created_at_epoch, expires_at_epoch (when present).
+    """
+    if raw is None:
+        return {}
+    raw_s = _to_str(raw)
+
+    try:
+        if raw_s.startswith("{"):
+            meta = json.loads(raw_s)
+            return meta if isinstance(meta, dict) else {}
+        return {"reason": raw_s, "reason_code": "manual"}
+    except Exception:
+        return {"reason": raw_s, "reason_code": "manual"}
 
 
 @router.post("/tenants", response_model=TenantOut, dependencies=[Depends(require_admin)])
@@ -167,6 +227,73 @@ async def list_api_keys(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         }
         for k in keys
     ]
+
+
+@router.post("/keys/{key_id}/limits", dependencies=[Depends(require_admin)])
+async def set_key_limits(key_id: uuid.UUID, payload: ApiKeyLimitsIn, db: AsyncSession = Depends(get_db)):
+    api_key = await db.get(ApiKey, key_id)
+    if not api_key:
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    api_key.rate_limit = payload.rate_limit
+    api_key.rate_window = payload.rate_window
+    await db.commit()
+    await db.refresh(api_key)
+
+    return {
+        "status": "ok",
+        "key_id": str(api_key.id),
+        "rate_limit": api_key.rate_limit,
+        "rate_window": api_key.rate_window,
+    }
+
+
+@router.post("/keys/{key_id}/tier", dependencies=[Depends(require_admin)])
+async def set_key_tier(key_id: uuid.UUID, payload: ApiKeyTierIn, db: AsyncSession = Depends(get_db)):
+    tier = payload.tier.lower().strip()
+    if tier not in TIERS:
+        raise HTTPException(status_code=400, detail=f"Unknown tier: {tier}")
+
+    api_key = await db.get(ApiKey, key_id)
+    if not api_key:
+        raise HTTPException(status_code=404, detail="Key not found")
+
+    if api_key.revoked_at:
+        raise HTTPException(status_code=409, detail="Key is revoked")
+
+    api_key.rate_limit = TIERS[tier]["rate_limit"]
+    api_key.rate_window = TIERS[tier]["rate_window"]
+    await db.commit()
+    await db.refresh(api_key)
+
+    return {
+        "status": "ok",
+        "key_id": str(api_key.id),
+        "tier": tier,
+        "rate_limit": api_key.rate_limit,
+        "rate_window": api_key.rate_window,
+    }
+
+
+def _resolve_timerange(
+    from_ts: datetime | None,
+    to_ts: datetime | None,
+    default_hours: int = 24,
+) -> tuple[datetime, datetime]:
+    if not to_ts:
+        to_ts = datetime.now(timezone.utc)
+    if not from_ts:
+        from_ts = to_ts - timedelta(hours=default_hours)
+
+    if from_ts.tzinfo is None:
+        from_ts = from_ts.replace(tzinfo=timezone.utc)
+    if to_ts.tzinfo is None:
+        to_ts = to_ts.replace(tzinfo=timezone.utc)
+
+    if from_ts > to_ts:
+        raise HTTPException(status_code=400, detail="from_ts must be <= to_ts")
+
+    return from_ts, to_ts
 
 
 @router.get("/tenants/{tenant_id}/usage/summary", dependencies=[Depends(require_admin)])
@@ -360,63 +487,6 @@ async def list_usage_events(
     ]
 
 
-@router.post("/keys/{key_id}/limits", dependencies=[Depends(require_admin)])
-async def set_key_limits(key_id: uuid.UUID, payload: ApiKeyLimitsIn, db: AsyncSession = Depends(get_db)):
-    api_key = await db.get(ApiKey, key_id)
-    if not api_key:
-        raise HTTPException(status_code=404, detail="Key not found")
-
-    api_key.rate_limit = payload.rate_limit
-    api_key.rate_window = payload.rate_window
-    await db.commit()
-    await db.refresh(api_key)
-
-    return {"status": "ok", "key_id": str(api_key.id), "rate_limit": api_key.rate_limit, "rate_window": api_key.rate_window}
-
-
-@router.post("/keys/{key_id}/tier", dependencies=[Depends(require_admin)])
-async def set_key_tier(key_id: uuid.UUID, payload: ApiKeyTierIn, db: AsyncSession = Depends(get_db)):
-    tier = payload.tier.lower().strip()
-    if tier not in TIERS:
-        raise HTTPException(status_code=400, detail=f"Unknown tier: {tier}")
-
-    api_key = await db.get(ApiKey, key_id)
-    if not api_key:
-        raise HTTPException(status_code=404, detail="Key not found")
-
-    if api_key.revoked_at:
-        raise HTTPException(status_code=409, detail="Key is revoked")
-
-    api_key.rate_limit = TIERS[tier]["rate_limit"]
-    api_key.rate_window = TIERS[tier]["rate_window"]
-    await db.commit()
-    await db.refresh(api_key)
-
-    return {
-        "status": "ok",
-        "key_id": str(api_key.id),
-        "tier": tier,
-        "rate_limit": api_key.rate_limit,
-        "rate_window": api_key.rate_window,
-    }
-
-
-def _resolve_timerange(from_ts: datetime | None, to_ts: datetime | None, default_hours: int = 24) -> tuple[datetime, datetime]:
-    """Normalize timerange query params (UTC) and apply sane defaults."""
-    if not to_ts:
-        to_ts = datetime.now(timezone.utc)
-    if not from_ts:
-        from_ts = to_ts - timedelta(hours=default_hours)
-    # Ensure tz-aware
-    if from_ts.tzinfo is None:
-        from_ts = from_ts.replace(tzinfo=timezone.utc)
-    if to_ts.tzinfo is None:
-        to_ts = to_ts.replace(tzinfo=timezone.utc)
-    if from_ts > to_ts:
-        raise HTTPException(status_code=400, detail="from_ts must be <= to_ts")
-    return from_ts, to_ts
-
-
 @router.get("/usage/unauth", dependencies=[Depends(require_admin)])
 async def unauth_usage(
     from_ts: datetime | None = None,
@@ -424,7 +494,6 @@ async def unauth_usage(
     top_limit: int = 10,
     db: AsyncSession = Depends(get_db),
 ):
-    """Global view of unauthenticated traffic (tenant_id/api_key_id are NULL)."""
     from_ts, to_ts = _resolve_timerange(from_ts, to_ts, default_hours=24)
     top_limit = min(max(top_limit, 1), 50)
 
@@ -513,7 +582,6 @@ async def abuse_suspects(
     limit: int = 20,
     db: AsyncSession = Depends(get_db),
 ):
-    """Lightweight abuse detection: IPs with high unauth 401 volume in a rolling window."""
     window_minutes = min(max(window_minutes, 1), 24 * 60)
     min_unauth_401 = min(max(min_unauth_401, 1), 1_000_000)
     limit = min(max(limit, 1), 200)
@@ -559,12 +627,9 @@ async def abuse_suspects(
         )
         rows = paths_result.all()
 
-        # Keep top 3 paths per IP
         for r in rows:
             bucket = top_paths_by_ip.get(r.client_ip)
-            if bucket is None:
-                continue
-            if len(bucket) >= 3:
+            if bucket is None or len(bucket) >= 3:
                 continue
             bucket.append({"path": r.path, "count": int(r.count)})
 
@@ -584,8 +649,102 @@ async def abuse_suspects(
             for s in suspects
         ],
     }
-    
-    
+
+
+@router.get("/abuse/ip/{client_ip}", dependencies=[Depends(require_admin)])
+async def ip_timeline(
+    client_ip: str,
+    minutes: int = 60,
+    limit: int = 200,
+    db: AsyncSession = Depends(get_db),
+):
+    minutes = min(max(minutes, 1), 24 * 60)
+    limit = min(max(limit, 1), 500)
+
+    to_ts = datetime.now(timezone.utc)
+    from_ts = to_ts - timedelta(minutes=minutes)
+
+    where = (
+        UsageEvent.client_ip == client_ip,
+        UsageEvent.ts >= from_ts,
+        UsageEvent.ts <= to_ts,
+    )
+
+    status_rows = (
+        await db.execute(
+            select(
+                UsageEvent.status_code,
+                func.count().label("count"),
+            )
+            .where(*where)
+            .group_by(UsageEvent.status_code)
+            .order_by(UsageEvent.status_code.asc())
+        )
+    ).all()
+
+    signals = (
+        await db.execute(
+            select(
+                func.sum(case((UsageEvent.tenant_id.is_(None), 1), else_=0)).label("unauth_rows"),
+                func.sum(case((UsageEvent.status_code == 401, 1), else_=0)).label("unauth_401"),
+                func.sum(case((UsageEvent.status_code == 429, 1), else_=0)).label("rate_limited_429"),
+                func.sum(case((UsageEvent.status_code.between(200, 299), 1), else_=0)).label("success_2xx"),
+            ).where(*where)
+        )
+    ).one()
+
+    top_paths = (
+        await db.execute(
+            select(
+                UsageEvent.path,
+                func.count().label("count"),
+            )
+            .where(*where)
+            .group_by(UsageEvent.path)
+            .order_by(func.count().desc())
+            .limit(10)
+        )
+    ).all()
+
+    events = (
+        await db.execute(
+            select(UsageEvent)
+            .where(*where)
+            .order_by(desc(UsageEvent.ts))
+            .limit(limit)
+        )
+    ).scalars().all()
+
+    return {
+        "client_ip": client_ip,
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "counts": {
+            "total": sum(int(r.count) for r in status_rows),
+            "unauth_rows": int(signals.unauth_rows or 0),
+            "unauth_401": int(signals.unauth_401 or 0),
+            "rate_limited_429": int(signals.rate_limited_429 or 0),
+            "success_2xx": int(signals.success_2xx or 0),
+        },
+        "by_status": {str(r.status_code): int(r.count) for r in status_rows},
+        "top_paths": [{"path": r.path, "count": int(r.count)} for r in top_paths],
+        "events": [
+            {
+                "ts": e.ts,
+                "tenant_id": str(e.tenant_id) if e.tenant_id else None,
+                "api_key_id": str(e.api_key_id) if e.api_key_id else None,
+                "method": e.method,
+                "path": e.path,
+                "status_code": e.status_code,
+                "latency_ms": e.latency_ms,
+                "request_id": e.request_id,
+                "user_agent": e.user_agent,
+            }
+            for e in events
+        ],
+    }
+
+
 @router.get("/usage/rate-limited", dependencies=[Depends(require_admin)])
 async def global_rate_limited_usage(
     from_ts: datetime | None = None,
@@ -630,15 +789,10 @@ async def global_rate_limited_usage(
         "from_ts": from_ts,
         "to_ts": to_ts,
         "total_429": int(total or 0),
-        "top_paths": [
-            {"path": r.path, "count": int(r.count)}
-            for r in top_paths.all()
-        ],
-        "by_tenant": [
-            {"tenant_id": str(r.tenant_id), "count": int(r.count)}
-            for r in by_tenant.all()
-        ],
+        "top_paths": [{"path": r.path, "count": int(r.count)} for r in top_paths.all()],
+        "by_tenant": [{"tenant_id": str(r.tenant_id), "count": int(r.count)} for r in by_tenant.all()],
     }
+
 
 @router.get(
     "/tenants/{tenant_id}/usage/rate-limited",
@@ -690,15 +844,10 @@ async def tenant_rate_limited_usage(
         "from_ts": from_ts,
         "to_ts": to_ts,
         "total_429": int(total or 0),
-        "by_key": [
-            {"api_key_id": str(r.api_key_id), "count": int(r.count)}
-            for r in by_key.all()
-        ],
-        "top_paths": [
-            {"path": r.path, "count": int(r.count)}
-            for r in top_paths.all()
-        ],
+        "by_key": [{"api_key_id": str(r.api_key_id), "count": int(r.count)} for r in by_key.all()],
+        "top_paths": [{"path": r.path, "count": int(r.count)} for r in top_paths.all()],
     }
+
 
 @router.get(
     "/tenants/{tenant_id}/keys/near-quota",
@@ -733,8 +882,7 @@ async def keys_near_quota(
         window_start = now - timedelta(seconds=key.rate_window)
 
         count = await db.scalar(
-            select(func.count())
-            .where(
+            select(func.count()).where(
                 UsageEvent.api_key_id == key.id,
                 UsageEvent.ts >= window_start,
             )
@@ -760,122 +908,6 @@ async def keys_near_quota(
         "threshold": threshold,
         "keys": results[:limit],
     }
-    
-    
-@router.get("/abuse/ip/{client_ip}", dependencies=[Depends(require_admin)])
-async def ip_timeline(
-    client_ip: str,
-    minutes: int = 60,
-    limit: int = 200,
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Timeline view for a single IP:
-    - last N events in a rolling window
-    - status breakdown + top paths
-    """
-    minutes = min(max(minutes, 1), 24 * 60)
-    limit = min(max(limit, 1), 500)
-
-    to_ts = datetime.now(timezone.utc)
-    from_ts = to_ts - timedelta(minutes=minutes)
-
-    where = (
-        UsageEvent.client_ip == client_ip,
-        UsageEvent.ts >= from_ts,
-        UsageEvent.ts <= to_ts,
-    )
-
-    # Status breakdown
-    status_rows = (
-        await db.execute(
-            select(
-                UsageEvent.status_code,
-                func.count().label("count"),
-            )
-            .where(*where)
-            .group_by(UsageEvent.status_code)
-            .order_by(UsageEvent.status_code.asc())
-        )
-    ).all()
-
-    # Quick signals: unauth vs rate-limited vs success
-    signals = (
-        await db.execute(
-            select(
-                func.sum(
-                    case((UsageEvent.tenant_id.is_(None), 1), else_=0)
-                ).label("unauth_rows"),
-                func.sum(
-                    case((UsageEvent.status_code == 401, 1), else_=0)
-                ).label("unauth_401"),
-                func.sum(
-                    case((UsageEvent.status_code == 429, 1), else_=0)
-                ).label("rate_limited_429"),
-                func.sum(
-                    case((UsageEvent.status_code.between(200, 299), 1), else_=0)
-                ).label("success_2xx"),
-            )
-            .where(*where)
-        )
-    ).one()
-
-    # Top paths (within window)
-    top_paths = (
-        await db.execute(
-            select(
-                UsageEvent.path,
-                func.count().label("count"),
-            )
-            .where(*where)
-            .group_by(UsageEvent.path)
-            .order_by(func.count().desc())
-            .limit(10)
-        )
-    ).all()
-
-    # Timeline events
-    events = (
-        await db.execute(
-            select(UsageEvent)
-            .where(*where)
-            .order_by(desc(UsageEvent.ts))
-            .limit(limit)
-        )
-    ).scalars().all()
-
-    return {
-        "client_ip": client_ip,
-        "from_ts": from_ts,
-        "to_ts": to_ts,
-        "counts": {
-            "total": sum(int(r.count) for r in status_rows),
-            "unauth_rows": int(signals.unauth_rows or 0),
-            "unauth_401": int(signals.unauth_401 or 0),
-            "rate_limited_429": int(signals.rate_limited_429 or 0),
-            "success_2xx": int(signals.success_2xx or 0),
-        },
-        "by_status": {str(r.status_code): int(r.count) for r in status_rows},
-        "top_paths": [{"path": r.path, "count": int(r.count)} for r in top_paths],
-        "events": [
-            {
-                "ts": e.ts,
-                "tenant_id": str(e.tenant_id) if e.tenant_id else None,
-                "api_key_id": str(e.api_key_id) if e.api_key_id else None,
-                "method": e.method,
-                "path": e.path,
-                "status_code": e.status_code,
-                "latency_ms": e.latency_ms,
-                "request_id": e.request_id,
-                "user_agent": e.user_agent,
-            }
-            for e in events
-        ],
-    }
-
-BLOCK_IP_PREFIX = "blk:ip:"
-BLOCK_IP_PREFIX = "blk:ip:"
-BLOCK_IP_INDEX_KEY = "blk:index"  # ZSET: member=ip, score=expiry_epoch
 
 
 @router.post("/abuse/block-ip", dependencies=[Depends(require_admin)])
@@ -883,22 +915,36 @@ async def block_ip(
     payload: BlockIpIn,
     r: Redis = Depends(get_redis),
 ):
-    key = f"{BLOCK_IP_PREFIX}{payload.client_ip}"
     now = datetime.now(timezone.utc)
-    expiry_epoch = int((now + timedelta(seconds=payload.ttl_seconds)).timestamp())
+    created_at_epoch = int(now.timestamp())
+    expires_at_epoch = int((now + timedelta(seconds=payload.ttl_seconds)).timestamp())
 
+    reason_code = payload.reason_code if payload.reason_code in ALLOWED_REASON_CODES else "manual"
+    block_id = str(uuid.uuid4())
+
+    value = _make_block_payload(
+        block_id=block_id,
+        reason_code=reason_code,
+        reason=payload.reason,
+        created_at_epoch=created_at_epoch,
+        expires_at_epoch=expires_at_epoch,
+    )
+
+    key = f"{BLOCK_IP_PREFIX}{payload.client_ip}"
     pipe = r.pipeline()
-    pipe.set(key, payload.reason, ex=payload.ttl_seconds)
-    pipe.zadd(BLOCK_IP_INDEX_KEY, {payload.client_ip: expiry_epoch})
+    pipe.set(key, value, ex=payload.ttl_seconds)
+    pipe.zadd(BLOCK_IP_INDEX_KEY, {payload.client_ip: expires_at_epoch})
     await pipe.execute()
 
     ttl = await r.ttl(key)
     return {
         "status": "blocked",
         "client_ip": payload.client_ip,
-        "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
+        "block_id": block_id,
+        "reason_code": reason_code,
         "reason": payload.reason,
-        "expires_at_epoch": expiry_epoch,
+        "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
+        "expires_at_epoch": expires_at_epoch,
     }
 
 
@@ -932,25 +978,118 @@ async def list_blocked_ips(
     blocked = []
     count = 0
 
-    async for key in r.scan_iter(match=f"{BLOCK_IP_PREFIX}*"):
+    async for k in r.scan_iter(match=f"{BLOCK_IP_PREFIX}*"):
         if count >= limit:
             break
+
+        key = _to_str(k)
         ip = key.replace(BLOCK_IP_PREFIX, "", 1)
+
         ttl = await r.ttl(key)
-        reason = await r.get(key)
+        raw = await r.get(key)
+        meta = _parse_block_value(raw)
+
         blocked.append(
             {
                 "client_ip": ip,
                 "ttl_seconds": int(ttl) if ttl and ttl > 0 else None,
-                "reason": reason,
+                "block_id": meta.get("block_id"),
+                "reason_code": meta.get("reason_code") or "manual",
+                "reason": meta.get("reason"),
+                "expires_at_epoch": meta.get("expires_at_epoch"),
             }
         )
         count += 1
 
-    # Sort: shortest TTL first (nice for operators)
     blocked.sort(key=lambda x: (x["ttl_seconds"] is None, x["ttl_seconds"] or 10**9))
-
     return {"count": len(blocked), "blocked": blocked}
+
+
+@router.get("/abuse/blocked/{client_ip}", dependencies=[Depends(require_admin)])
+async def blocked_details(
+    client_ip: str,
+    r: Redis = Depends(get_redis),
+):
+    key = f"{BLOCK_IP_PREFIX}{client_ip}"
+    raw = await r.get(key)
+    if raw is None:
+        return {"client_ip": client_ip, "blocked": False}
+
+    meta = _parse_block_value(raw)
+    ttl = await r.ttl(key)
+
+    return {
+        "client_ip": client_ip,
+        "blocked": True,
+        "block_id": meta.get("block_id"),
+        "reason_code": meta.get("reason_code") or "manual",
+        "reason": meta.get("reason"),
+        "ttl_seconds": int(ttl) if ttl and ttl > 0 else None,
+        "expires_at_epoch": meta.get("expires_at_epoch"),
+    }
+
+
+@router.get("/abuse/blocks/report", dependencies=[Depends(require_admin)])
+async def blocks_report(
+    lookback_minutes: int = 60,
+    limit: int = 200,
+    r: Redis = Depends(get_redis),
+):
+    lookback_minutes = min(max(lookback_minutes, 1), 7 * 24 * 60)
+    limit = min(max(limit, 1), 1000)
+
+    now = datetime.now(timezone.utc)
+    now_epoch = int(now.timestamp())
+    since_epoch = now_epoch - (lookback_minutes * 60)
+
+    ips_raw = await r.zrangebyscore(BLOCK_IP_INDEX_KEY, since_epoch, now_epoch + 10**9)
+    ips = [_to_str(x) for x in ips_raw][:limit]
+
+    active = []
+    expired_recently = []
+    stale = []
+
+    for ip in ips:
+        key = f"{BLOCK_IP_PREFIX}{ip}"
+        raw = await r.get(key)
+        ttl = await r.ttl(key)
+        expiry_epoch = await r.zscore(BLOCK_IP_INDEX_KEY, ip)
+
+        if raw is None:
+            if expiry_epoch is not None and int(expiry_epoch) >= since_epoch:
+                expired_recently.append({"client_ip": ip, "expired_at_epoch": int(expiry_epoch)})
+            else:
+                stale.append(ip)
+            continue
+
+        meta = _parse_block_value(raw)
+
+        active.append(
+            {
+                "client_ip": ip,
+                "ttl_seconds": int(ttl) if ttl and ttl > 0 else None,
+                "expires_at_epoch": meta.get("expires_at_epoch") or (int(expiry_epoch) if expiry_epoch is not None else None),
+                "block_id": meta.get("block_id"),
+                "reason_code": meta.get("reason_code") or "manual",
+                "reason": meta.get("reason"),
+            }
+        )
+
+    if stale:
+        await r.zrem(BLOCK_IP_INDEX_KEY, *stale)
+
+    active.sort(key=lambda x: (x["ttl_seconds"] is None, x["ttl_seconds"] or 10**9))
+    expired_recently.sort(key=lambda x: x["expired_at_epoch"], reverse=True)
+
+    return {
+        "lookback_minutes": lookback_minutes,
+        "now_epoch": now_epoch,
+        "active_count": len(active),
+        "expired_recently_count": len(expired_recently),
+        "active": active,
+        "expired_recently": expired_recently[:limit],
+        "cleaned_stale_index_members": len(stale),
+    }
 
 
 @router.post("/abuse/auto-block", dependencies=[Depends(require_admin)])
@@ -990,6 +1129,8 @@ async def auto_block_from_suspects(
     )
     suspects = suspects_result.all()
 
+    reason_code = payload.reason_code if payload.reason_code in ALLOWED_REASON_CODES else "manual"
+
     blocked = []
     skipped = []
 
@@ -1000,26 +1141,38 @@ async def auto_block_from_suspects(
             skipped.append({"client_ip": ip, "reason": "localhost_block_protection"})
             continue
 
-        key = f"{BLOCK_IP_PREFIX}{ip}"
+        now = datetime.now(timezone.utc)
+        created_at_epoch = int(now.timestamp())
+        expires_at_epoch = int((now + timedelta(seconds=payload.ttl_seconds)).timestamp())
+        block_id = str(uuid.uuid4())
 
         if payload.dry_run:
             blocked.append(
                 {
                     "client_ip": ip,
                     "unauth_401_count": int(s.unauth_401_count),
-                    "ttl_seconds": payload.ttl_seconds,
+                    "block_id": block_id,
+                    "reason_code": reason_code,
                     "reason": payload.reason,
+                    "ttl_seconds": payload.ttl_seconds,
+                    "expires_at_epoch": expires_at_epoch,
                     "dry_run": True,
                 }
             )
             continue
 
-        now = datetime.now(timezone.utc)
-        expiry_epoch = int((now + timedelta(seconds=payload.ttl_seconds)).timestamp())
+        key = f"{BLOCK_IP_PREFIX}{ip}"
+        value = _make_block_payload(
+            block_id=block_id,
+            reason_code=reason_code,
+            reason=payload.reason,
+            created_at_epoch=created_at_epoch,
+            expires_at_epoch=expires_at_epoch,
+        )
 
         pipe = r.pipeline()
-        pipe.set(key, payload.reason, ex=payload.ttl_seconds)
-        pipe.zadd(BLOCK_IP_INDEX_KEY, {ip: expiry_epoch})
+        pipe.set(key, value, ex=payload.ttl_seconds)
+        pipe.zadd(BLOCK_IP_INDEX_KEY, {ip: expires_at_epoch})
         await pipe.execute()
 
         ttl = await r.ttl(key)
@@ -1028,8 +1181,11 @@ async def auto_block_from_suspects(
             {
                 "client_ip": ip,
                 "unauth_401_count": int(s.unauth_401_count),
-                "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
+                "block_id": block_id,
+                "reason_code": reason_code,
                 "reason": payload.reason,
+                "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
+                "expires_at_epoch": expires_at_epoch,
                 "dry_run": False,
             }
         )
@@ -1045,95 +1201,10 @@ async def auto_block_from_suspects(
         "blocked_count": len(blocked),
         "skipped_count": len(skipped),
         "blocked": blocked,
-        "expires_at_epoch": expiry_epoch,
         "skipped": skipped,
     }
-    
-    
-@router.get("/abuse/blocked/{client_ip}", dependencies=[Depends(require_admin)])
-async def blocked_details(
-    client_ip: str,
-    r: Redis = Depends(get_redis),
-):
-    key = f"{BLOCK_IP_PREFIX}{client_ip}"
-    reason = await r.get(key)
-    if reason is None:
-        return {"client_ip": client_ip, "blocked": False}
-
-    ttl = await r.ttl(key)
-    return {
-        "client_ip": client_ip,
-        "blocked": True,
-        "reason": reason,
-        "ttl_seconds": int(ttl) if ttl and ttl > 0 else None,
-    }
 
 
-@router.get("/abuse/blocks/report", dependencies=[Depends(require_admin)])
-async def blocks_report(
-    lookback_minutes: int = 60,
-    limit: int = 200,
-    r: Redis = Depends(get_redis),
-):
-    lookback_minutes = min(max(lookback_minutes, 1), 7 * 24 * 60)
-    limit = min(max(limit, 1), 1000)
-
-    now = datetime.now(timezone.utc)
-    now_epoch = int(now.timestamp())
-    since_epoch = now_epoch - (lookback_minutes * 60)
-
-    # Pull relevant IPs from the index (both active and recently expired by score window)
-    ips = await r.zrangebyscore(BLOCK_IP_INDEX_KEY, since_epoch, now_epoch + 10**9)
-    ips = ips[:limit]
-
-    active = []
-    expired_recently = []
-    stale = []
-
-    for ip in ips:
-        key = f"{BLOCK_IP_PREFIX}{ip}"
-        reason = await r.get(key)
-        ttl = await r.ttl(key)
-        expiry_epoch = await r.zscore(BLOCK_IP_INDEX_KEY, ip)
-
-        if reason is None:
-            # Key is gone: either expired or was manually unblocked but not removed (stale)
-            if expiry_epoch is not None and int(expiry_epoch) >= since_epoch:
-                expired_recently.append(
-                    {"client_ip": ip, "expired_at_epoch": int(expiry_epoch)}
-                )
-            else:
-                stale.append(ip)
-            continue
-
-        active.append(
-            {
-                "client_ip": ip,
-                "reason": reason,
-                "ttl_seconds": int(ttl) if ttl and ttl > 0 else None,
-                "expires_at_epoch": int(expiry_epoch) if expiry_epoch is not None else None,
-            }
-        )
-
-    # Cleanup stale index entries (optional but keeps index honest)
-    if stale:
-        await r.zrem(BLOCK_IP_INDEX_KEY, *stale)
-
-    # Sort for operator sanity
-    active.sort(key=lambda x: (x["ttl_seconds"] is None, x["ttl_seconds"] or 10**9))
-    expired_recently.sort(key=lambda x: x["expired_at_epoch"], reverse=True)
-
-    return {
-        "lookback_minutes": lookback_minutes,
-        "now_epoch": now_epoch,
-        "active_count": len(active),
-        "expired_recently_count": len(expired_recently),
-        "active": active,
-        "expired_recently": expired_recently[:limit],
-        "cleaned_stale_index_members": len(stale),
-    }
- 
-    
 @router.post("/abuse/suspects/block", dependencies=[Depends(require_admin)])
 async def block_top_suspects(
     payload: BlockSuspectsIn,
@@ -1169,37 +1240,50 @@ async def block_top_suspects(
     )
     suspects = suspects_result.all()
 
+    reason_code = payload.reason_code if payload.reason_code in ALLOWED_REASON_CODES else "manual"
+
     blocked = []
     skipped = []
 
     for s in suspects:
         ip = s.client_ip
 
-        # Safety: don't block localhost unless explicitly allowed
         if ip in ("127.0.0.1", "::1") and (not payload.include_localhost) and (not settings.allow_block_localhost):
             skipped.append({"client_ip": ip, "reason": "localhost_block_protection"})
             continue
 
         now = datetime.now(timezone.utc)
-        expiry_epoch = int((now + timedelta(seconds=payload.ttl_seconds)).timestamp())
+        created_at_epoch = int(now.timestamp())
+        expires_at_epoch = int((now + timedelta(seconds=payload.ttl_seconds)).timestamp())
+        block_id = str(uuid.uuid4())
 
         if payload.dry_run:
             blocked.append(
                 {
                     "client_ip": ip,
                     "unauth_401_count": int(s.unauth_401_count),
-                    "ttl_seconds": payload.ttl_seconds,
-                    "expires_at_epoch": expiry_epoch,
+                    "block_id": block_id,
+                    "reason_code": reason_code,
                     "reason": payload.reason,
+                    "ttl_seconds": payload.ttl_seconds,
+                    "expires_at_epoch": expires_at_epoch,
                     "dry_run": True,
                 }
             )
             continue
 
         key = f"{BLOCK_IP_PREFIX}{ip}"
+        value = _make_block_payload(
+            block_id=block_id,
+            reason_code=reason_code,
+            reason=payload.reason,
+            created_at_epoch=created_at_epoch,
+            expires_at_epoch=expires_at_epoch,
+        )
+
         pipe = r.pipeline()
-        pipe.set(key, payload.reason, ex=payload.ttl_seconds)
-        pipe.zadd(BLOCK_IP_INDEX_KEY, {ip: expiry_epoch})
+        pipe.set(key, value, ex=payload.ttl_seconds)
+        pipe.zadd(BLOCK_IP_INDEX_KEY, {ip: expires_at_epoch})
         await pipe.execute()
 
         ttl = await r.ttl(key)
@@ -1208,9 +1292,11 @@ async def block_top_suspects(
             {
                 "client_ip": ip,
                 "unauth_401_count": int(s.unauth_401_count),
-                "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
-                "expires_at_epoch": expiry_epoch,
+                "block_id": block_id,
+                "reason_code": reason_code,
                 "reason": payload.reason,
+                "ttl_seconds": int(ttl) if ttl and ttl > 0 else payload.ttl_seconds,
+                "expires_at_epoch": expires_at_epoch,
                 "dry_run": False,
             }
         )
