@@ -16,3 +16,6 @@ EXPOSE 8080
 
 COPY scripts/entrypoint.sh /app/entrypoint.sh
 CMD ["/app/entrypoint.sh"]
+
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini

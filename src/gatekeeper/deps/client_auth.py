@@ -47,7 +47,7 @@ async def require_client_key(
     per_key_window = getattr(api_key, "rate_window", None) or settings.rate_limit_window_seconds
 
     rl = await fixed_window_limit(
-        await r,
+        r,
         key=str(api_key.id),
         limit=int(per_key_limit),
         window_seconds=int(per_key_window),

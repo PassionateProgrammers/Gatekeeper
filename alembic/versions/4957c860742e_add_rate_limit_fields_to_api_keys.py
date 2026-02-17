@@ -1,8 +1,7 @@
 from alembic import op
 import sqlalchemy as sa
 
-
-revision = "add_rate_limit_to_api_keys"
+revision = "4957c860742e"
 down_revision = "8a7b808d0aaf"
 branch_labels = None
 depends_on = None

@@ -1,8 +1,8 @@
 from alembic import op
 import sqlalchemy as sa
 
-revision = "usage_events_allow_null_ids"
-down_revision = "fe4c825d82db"
+revision = "b782786cf01b"
+down_revision = "4957c860742e"
 branch_labels = None
 depends_on = None
 

@@ -17,12 +17,6 @@ def _get_client_ip(request: Request) -> str:
 
 
 class UsageLoggingMiddleware(BaseHTTPMiddleware):
-    """
-    Logs usage for ALL requests (including unauth/invalid keys).
-
-    tenant_id/api_key_id may be None for unauth attempts.
-    """
-
     async def dispatch(self, request: Request, call_next: Callable):
         start = time.perf_counter()
         response: Response | None = None
@@ -35,29 +29,30 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
 
             path = request.url.path
             if path in ("/health",):
-                return
+                # skip logging, but do not return from finally
+                pass
+            else:
+                tenant_id = getattr(request.state, "tenant_id", None)
+                api_key_id = getattr(request.state, "api_key_id", None)
+                status_code = response.status_code if response else 500
 
-            tenant_id = getattr(request.state, "tenant_id", None)
-            api_key_id = getattr(request.state, "api_key_id", None)
+                request_id = getattr(request.state, "request_id", None) or ""
+                user_agent = request.headers.get("user-agent") or ""
+                client_ip = _get_client_ip(request)
 
-            status_code = response.status_code if response else 500
-            request_id = getattr(request.state, "request_id", None) or ""
-            user_agent = request.headers.get("user-agent") or ""
-            client_ip = _get_client_ip(request)
-
-            async with SessionLocal() as db:
-                db.add(
-                    UsageEvent(
-                        tenant_id=tenant_id,      # can be None
-                        api_key_id=api_key_id,    # can be None
-                        method=request.method,
-                        path=path,
-                        status_code=status_code,
-                        latency_ms=latency_ms,
-                        ts=datetime.now(timezone.utc),
-                        request_id=request_id,
-                        client_ip=client_ip,
-                        user_agent=user_agent,
+                async with SessionLocal() as db:
+                    db.add(
+                        UsageEvent(
+                            tenant_id=tenant_id,
+                            api_key_id=api_key_id,
+                            method=request.method,
+                            path=path,
+                            status_code=status_code,
+                            latency_ms=latency_ms,
+                            ts=datetime.now(timezone.utc),
+                            request_id=request_id,
+                            client_ip=client_ip,
+                            user_agent=user_agent,
+                        )
                     )
-                )
-                await db.commit()
+                    await db.commit()
