@@ -14,3 +14,7 @@ python-json-logger==3.2.1
 alembic==1.14.0
 
 psycopg[binary]==3.2.4
+
+pytest
+pytest-asyncio
+httpx
