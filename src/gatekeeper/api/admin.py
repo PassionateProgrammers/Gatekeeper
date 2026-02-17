@@ -1340,7 +1340,6 @@ async def block_top_suspects(
         pipe.zadd(BLOCK_IP_INDEX_KEY, {ip: expires_at_epoch})
         await pipe.execute()
 
-        # NEW: audit event (log immediately after write)
         await _push_block_event(
             r,
             {

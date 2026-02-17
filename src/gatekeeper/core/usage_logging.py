@@ -20,6 +20,9 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable):
         start = time.perf_counter()
         response: Response | None = None
+        
+        client_ip = _get_client_ip(request)
+        request.state.client_ip = client_ip
 
         try:
             response = await call_next(request)
@@ -38,9 +41,6 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
 
                 request_id = getattr(request.state, "request_id", None) or ""
                 user_agent = request.headers.get("user-agent") or ""
-                client_ip = _get_client_ip(request)
-
-                request.state.client_ip = client_ip
 
                 async with SessionLocal() as db:
                     db.add(

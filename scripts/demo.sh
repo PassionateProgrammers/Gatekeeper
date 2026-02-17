@@ -23,12 +23,24 @@ hdr "Expect 401 (invalid API key)"
 curl -i -sS "${BASE_URL}/protected" -H "Authorization: Bearer not-a-real-key" | head -n 20
 
 hdr "Create tenant"
-TENANT_JSON=$(curl -sS -X POST "${BASE_URL}/admin/tenants" \
+TENANT_NAME="demo-tenant-$(date +%s)-$RANDOM"
+
+TENANT_RESP=$(curl -sS -w "\n%{http_code}" -X POST "${BASE_URL}/admin/tenants" \
   -H "X-Admin-Token: ${ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
-  -d '{"name":"demo-tenant"}')
-echo "${TENANT_JSON}"
-TENANT_ID=$(python -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "${TENANT_JSON}")
+  -d "{\"name\":\"${TENANT_NAME}\"}")
+
+TENANT_BODY=$(echo "${TENANT_RESP}" | head -n 1)
+TENANT_CODE=$(echo "${TENANT_RESP}" | tail -n 1)
+
+echo "${TENANT_BODY}"
+
+if [[ "${TENANT_CODE}" != "200" ]]; then
+  echo "ERROR: create tenant failed (HTTP ${TENANT_CODE})"
+  exit 1
+fi
+
+TENANT_ID=$(python -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "${TENANT_BODY}")
 
 hdr "Create API key"
 KEY_JSON=$(curl -sS -X POST "${BASE_URL}/admin/tenants/${TENANT_ID}/keys" \
