@@ -9,6 +9,8 @@ docker compose up --build
 curl http://localhost:8080/health
 
 ## run demo
+docker compose down -v
+docker compose up --build
 ADMIN_TOKEN=dev-admin-token ./scripts/demo.sh
 
 ## run tests
