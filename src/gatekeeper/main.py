@@ -2,6 +2,7 @@ import logging
 from fastapi import FastAPI, Request
 from gatekeeper.config import settings
 from gatekeeper.logging import setup_logging
+from gatekeeper.core.ip_blocklist import IPBlocklistMiddleware
 from gatekeeper.core.request_id import RequestIdMiddleware
 from gatekeeper.core.usage_logging import UsageLoggingMiddleware
 from gatekeeper.api.health import router as health_router

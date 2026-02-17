@@ -8,11 +8,6 @@ from gatekeeper.models.api_key import ApiKey
 router = APIRouter(tags=["gateway"])
 
 
-@router.get("/health")
-async def health():
-    return {"status": "ok"}
-
-
 @router.get("/protected")
 async def protected(api_key: ApiKey = Depends(require_client_key)):
     return {"ok": True, "tenant_id": str(api_key.tenant_id), "api_key_id": str(api_key.id)}
