@@ -26,3 +26,7 @@ app.include_router(gateway_router)
 @app.on_event("shutdown")
 async def shutdown():
     await close_redis()
+
+@app.get("/")
+async def root():
+    return {"service": "gatekeeper", "status": "ok"}
