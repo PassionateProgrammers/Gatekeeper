@@ -40,6 +40,8 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
                 user_agent = request.headers.get("user-agent") or ""
                 client_ip = _get_client_ip(request)
 
+                request.state.client_ip = client_ip
+
                 async with SessionLocal() as db:
                     db.add(
                         UsageEvent(
